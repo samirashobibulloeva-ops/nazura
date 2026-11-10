@@ -4087,6 +4087,17 @@
       .tplchip .tplbtn { padding: 8px 12px; min-height: 40px; font-weight: 600; font-size: 13px; }
       .tplchip .tpled { padding: 0 10px; border-left: 1px solid var(--line); color: var(--muted); min-width: 36px; }
       .tplchip .tpled:hover { color: var(--accent); }
+
+      /* ===== Пакет правок 13 ===== */
+      /* кто добавил блюдо, если это не официант стола */
+      .addby { display: block; color: var(--warn); font-weight: 600; font-size: 12px; }
+      .addby.qr { color: var(--muted); font-weight: 500; }
+      /* официант стола в адисьоне */
+      .wbar { display: flex; align-items: center; gap: 8px; width: 100%; font-size: 13px; color: var(--muted); }
+      .wbar svg { width: 16px; height: 16px; flex: none; }
+      .wbar .sel { flex: 1; min-height: 40px; }
+      .wbar.warnb { color: var(--fg); background: color-mix(in srgb, var(--warn) 14%, transparent); border-radius: 10px; padding: 8px 10px; }
+      .tile .chip.onl { align-self: flex-start; font-size: 11px; padding: 2px 8px; }
     </style>
   </head>
   <body>
@@ -4579,7 +4590,8 @@
 
       const isG = k => ING[k].u === "g";
 
-      const uPrice = k => (isG(k) ? ING[k].cost * 1000 : ING[k].cost);
+      const uPrice = k => (isG(k) ? ING[k].cost * 1000 : ING[k].cost); // ortalama maliyet (kg / adet)
+      const uLast = k => (isG(k) ? (ING[k].last ?? ING[k].cost) * 1000 : ING[k].last ?? ING[k].cost); // son alış fiyatı
 
       const uLbl = k => (isG(k) ? "₺/kg" : "₺/adet");
 
@@ -4681,14 +4693,29 @@
 
       const poTotal = po => po.lines.reduce((s, [k, q, pr]) => s + (ING[k] ? q * (pr ?? uPrice(k)) : 0), 0);
 
+      // Ortalama maliyet: (eldeki stok × eski maliyet + gelen × yeni fiyat) ÷ toplam stok.
+      // Stok yoksa (veya eksideyse) yeni fiyat geçerli olur. Son alış fiyatı ayrıca saklanır (sipariş önerisi için).
+      // Dönüş: maliyet değiştiyse { k, old }, değişmediyse false.
+      function stockIn(k, qty, unitCost) {
+        const g = ING[k],
+          old = g.cost,
+          have = Math.max(0, g.s);
+        g.cost = have + qty > 0 ? (have * old + qty * unitCost) / (have + qty) : unitCost;
+        g.last = unitCost;
+        g.s += qty;
+        return Math.abs(g.cost - old) > 1e-6 ? { k, old } : false;
+      }
+
+      // Satır maliyeti (1 adet): reçete + seçenekler. “Çıkar” (soğansız vb.) maliyeti düşürür, ekstra artırır.
+      const lineCost = (i, pack) => itemRec(i, pack).reduce((s, [k, q]) => s + (ING[k] ? ING[k].cost * q : 0), 0);
+
       function receive(k) {
         const qIn = Math.max(0, +$("#bq-" + k)?.value || 0),
           pIn = Math.max(0, +$("#bp-" + k)?.value || 0);
         if (!qIn) return null;
         const qty = isG(k) ? qIn * 1000 : qIn,
-          old = ING[k].cost,
           newCost = isG(k) ? pIn / 1000 : pIn;
-        ING[k].s += qty;
+        const ch = stockIn(k, qty, newCost);
         LOG.unshift({ t: now(), k, d: qty, why: "Tedarikçi teslimatı" });
         GIDER.push({
           id: ++GID,
@@ -4697,11 +4724,7 @@
           date: today(),
           note: `${ING[k].n} · ${qIn} ${qLbl(k)}`,
         });
-        if (Math.abs(newCost - old) > 1e-9) {
-          ING[k].cost = newCost;
-          return { k, old };
-        }
-        return false;
+        return ch;
       }
     </script>
 
@@ -4849,12 +4872,19 @@
         o.waiters = o.waiters || [];
         if (n !== o.by && !o.waiters.includes(n)) o.waiters.push(n);
       }
+      // Online ödendi mi (QR sitesi veya platform) — adisyonda, kartlarda ve arşivde rozet
+      const paidOnline = o => !!o.online || o.pay === "Online" || o.paid.some(p => /Online/.test(p.m));
+      const isQr = o => !!o.qr || o.paid.some(p => /QR/.test(p.m));
       const waitersOf = o => [o.by, ...(o.waiters || [])].filter(Boolean);
-      // Masanın sorumlu garsonu (Ayarlar → İşletme ve masalar)
+      // Masanın sorumlu garsonu = masayı alan (açık adisyonun o.by). Hesap kapanınca masa boşalır.
       const tWaiter = t => {
-        const s = SF(TWAIT[t]);
-        return s && s.active ? s : null;
+        const o = tableOrder(t);
+        return o && (o.items.length || o.custId) && o.by ? o.by : "";
       };
+      // Garsonlar listesi (yönetici masanın garsonunu değiştirirken)
+      const garsons = () => STAFF.filter(x => x.active && x.role === "garson");
+      // Bu satırı masanın garsonu dışında biri mi ekledi?
+      const byOther = i => !!i.other && !!i.by;
 
       function addLine(o, spec) {
         const p = P(spec.pid);
@@ -4865,9 +4895,12 @@
           ni.mods = spec.mods;
           ni.price += spec.mods.reduce((s, m) => s + (m.p || 0), 0);
         }
-        const ex = o.items.find(i => !i.sent && !i.gift && !i.ikram && lineKey(i) === lineKey(ni));
-        ex ? ex.qty++ : o.items.push(ni);
         noteWaiter(o);
+        // Kim ekledi: masanın garsonu değilse satır işaretlenir (adisyonda, arşivde ve Excel'de görünür)
+        ni.by = spec.by || S.user?.n || "";
+        if (!spec.by && o.channel === "masa" && o.by && ni.by && ni.by !== o.by) ni.other = true;
+        const ex = o.items.find(i => !i.sent && !i.gift && !i.ikram && lineKey(i) === lineKey(ni) && (i.by || "") === ni.by);
+        ex ? ex.qty++ : o.items.push(ni);
         return p;
       }
 
@@ -4966,9 +4999,13 @@
           S.orders.push(o);
         }
         q.items.forEach(i => {
-          for (let k = 0; k < i.qty; k++) addLine(o, { pid: i.pid, note: i.note });
+          for (let k = 0; k < i.qty; k++) addLine(o, { pid: i.pid, note: i.note, by: "Misafir (QR)" });
         });
-        if (q.paid) o.paid.push({ m: "Online (QR)", a: q.total });
+        if (q.paid) {
+          o.paid.push({ m: "Online (QR)", a: q.total });
+          o.online = true;
+        }
+        o.qr = true;
         sendItems(o, "Satış: Masa " + o.table + " (QR)");
         o.stage = "alindi";
         q.status = "onay";
@@ -5031,7 +5068,7 @@
           o.items
             .filter(i => i.gift)
             .forEach(i =>
-              GIFTS.push({ at: now(), pid: i.pid, cost: costOf(i.pid, o.channel !== "masa") * i.qty, cust: c.name }),
+              GIFTS.push({ at: now(), pid: i.pid, cost: lineCost(i, o.channel !== "masa") * i.qty, cust: c.name }),
             );
         if (o && o.loyDisc) GIFTS.push({ at: now(), disc: true, cost: (total(o) * (o.discount || 0)) / 100, cust: c.name });
       }
@@ -5383,7 +5420,6 @@
           EXTRA,
           QRORD,
           ROLES,
-          TWAIT,
           DEVICES,
           DEV,
           PLATFORMS,
@@ -5428,7 +5464,7 @@
             DEV,
             PLATFORMS,
           },
-          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, TWAIT };
+          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES };
         Object.entries(A).forEach(([k, a]) => {
           if (Array.isArray(d[k])) a.splice(0, a.length, ...d[k]);
         });
@@ -6039,7 +6075,6 @@
       ];
 
       // Masa garsonları: her masanın sorumlu garsonu { "M1": personelId }
-      const TWAIT = {};
 
       // Masadan QR sipariş: garson onayı ve masa başı sınır.
       const QRORD = { on: true, approve: true, onePending: true, maxItems: 15 };
@@ -6641,14 +6676,18 @@
         Object.entries({ 2: 142, 3: 96, 4: 150, 5: 160, 6: 110, 7: 118, 8: 64, 1: 180 }).forEach(
           ([id, h]) => (SF(+id).mh = h),
         );
-        // masa garsonları: M1–M5 Ali, M6–M10 Ayşe
-        HALLS.Salon.forEach((t, i) => (TWAIT[t] = i < HALLS.Salon.length / 2 ? 2 : 3));
-        // açık masaları açan garsonlar
+        // açık masaları alan garsonlar; ilk masada diğer garson bir içecek eklemiş
         S.orders
           .filter(o => o.channel === "masa" && o.status === "acik" && !o.by)
           .forEach((o, i) => {
-            o.by = SF(TWAIT[o.table])?.n || ["Ali", "Ayşe"][i % 2];
-            if (i === 0) o.waiters = [o.by === "Ali" ? "Ayşe" : "Ali"];
+            o.by = ["Ali", "Ayşe"][i % 2];
+            o.items.forEach(x => (x.by = o.by));
+            if (i === 0) {
+              const other = o.by === "Ali" ? "Ayşe" : "Ali",
+                dr = AP().find(p => p.cat === "icecek" && !p.combo);
+              o.waiters = [other];
+              if (dr) o.items.push(Object.assign(it(dr.id, 1, true, false, 5), { by: other, other: true }));
+            }
           });
         SF(2).adv.push({ date: dIn(10), amt: 2000, note: "Avans" });
         {
@@ -7034,16 +7073,15 @@
         const meG = S.user.role === "garson";
         const tiles = HALLS.Salon.map(t => {
           const o = tableOrder(t),
-            tw = tWaiter(t),
-            mine = meG && tw?.id === S.user.id;
+            mine = meG && !!o && o.by === S.user.n && (o.items.length || o.custId);
           if (qp.some(q => q.table === t))
             return `<button class="tile busy qrwait" style="--c:var(--bad)" data-act="table" data-t="${t}"><span class="tt"><span class="tn">${t}</span><span class="chip bad">QR onay</span></span>${o?.by ? `<span class="wtr">${IC.staff}${esc(waitersOf(o).join(", "))}</span>` : ""}<span class="tf"><span class="amt num">${fmt((o ? net(o) : 0) + qp.filter(q => q.table === t).reduce((x, q) => x + q.total, 0))}</span></span></button>`;
           if (!o || (!o.items.length && !o.custId)) {
             const rv = resFor(t);
-            return `<button class="tile free ${rv ? "resv" : ""} ${mine ? "mine" : ""}" data-act="table" data-t="${t}" ${rv ? `title="${esc(rv.name)} · ${rv.people} kişi"` : ""}><span class="tn">${t}</span><span class="st">${rv ? `Rez. ${rv.time} · ${rv.people} kişi` : "Boş"}</span>${tw ? `<span class="wtr">${IC.staff}${esc(tw.n)}</span>` : ""}</button>`;
+            return `<button class="tile free ${rv ? "resv" : ""} ${mine ? "mine" : ""}" data-act="table" data-t="${t}" ${rv ? `title="${esc(rv.name)} · ${rv.people} kişi"` : ""}><span class="tn">${t}</span><span class="st">${rv ? `Rez. ${rv.time} · ${rv.people} kişi` : "Boş"}</span>${meG ? `<span class="wtr">Dokun · masayı al</span>` : ""}</button>`;
           }
           const c = now() - o.createdAt > 40 * 60000 ? "var(--warn)" : o.stage === "hazir" ? "var(--ok)" : "var(--accent)";
-          return `<button class="tile busy ${mine ? "mine" : ""}" style="--c:${c}" data-act="table" data-t="${t}"><span class="tt"><span class="tn">${t}</span>${tileChip(o)}</span>${o.custId ? `<span class="cn">${esc(C(o.custId).name)}</span>` : ""}${o.by ? `<span class="wtr">${IC.staff}${esc(waitersOf(o).join(", "))}</span>` : ""}<span class="tf"><span class="amt num">${fmt(net(o))}</span><span class="st" data-since="${o.createdAt}">${ago(o.createdAt)}</span></span></button>`;
+          return `<button class="tile busy ${mine ? "mine" : ""}" style="--c:${c}" data-act="table" data-t="${t}"><span class="tt"><span class="tn">${t}</span>${tileChip(o)}</span>${o.custId ? `<span class="cn">${esc(C(o.custId).name)}</span>` : ""}${o.by ? `<span class="wtr">${IC.staff}${esc(waitersOf(o).join(", "))}</span>` : ""}${paidOnline(o) ? '<span class="chip ok onl">Online ödendi</span>' : ""}<span class="tf"><span class="amt num">${fmt(net(o))}</span><span class="st" data-since="${o.createdAt}">${ago(o.createdAt)}</span></span></button>`;
         }).join("");
         const busy = HALLS.Salon.filter(t => {
           const o = tableOrder(t);
@@ -7173,6 +7211,7 @@
         const sub = on && o.customer?.address ? `<div class="cust">${esc(o.customer.address)}</div>` : "";
         const items = `<div class="oitems">${o.items.map(i => `${i.qty}× ${esc(iName(i))}${i.mods && i.mods.length ? ` <small>(${esc(iMods(i))})</small>` : ""}${i.ikram ? " <small>(ikram)</small>" : ""}${i.note ? ` <small>(${esc(i.note)})</small>` : ""}`).join(", ")}</div>`;
         const note = o.note ? `<div class="onote">Not: ${esc(o.note)}</div>` : "";
+        const onl = paidOnline(o) ? '<span class="chip ok">Online ödendi</span>' : "";
         let match = "";
         if (on && !closed) {
           if (cu)
@@ -7186,7 +7225,7 @@
         }
         let ctrl = "";
         if (closed)
-          ctrl = `<div class="lbl">${o.status === "iptal" ? (o.cancelReason ? "İptal edildi · " + esc(o.cancelReason) : "Reddedildi") : STL[o.stage] || "Kapandı"} · ${ago(o.closedAt || o.createdAt)}</div>`;
+          ctrl = `<div class="lbl">${o.status === "iptal" ? (o.cancelReason ? "İptal edildi · " + esc(o.cancelReason) : "Reddedildi") + (o.cancelBy ? " · " + esc(o.cancelBy) : "") : STL[o.stage] || "Kapandı"} · ${ago(o.closedAt || o.createdAt)}</div>`;
         else if (false) ctrl = "";
         else if (o.stage === "yeni")
           ctrl = `<div class="lbl" style="color:var(--bad)">Onay bekliyor</div><div class="row"><button class="btn pri" style="flex:1" data-act="accept" data-id="${o.id}">Onayla</button><button class="btn danger" data-act="reject" data-id="${o.id}">Reddet</button></div>`;
@@ -7209,14 +7248,27 @@
             ctrl += `<div class="row lnks">${o.items.some(i => !i.sent) ? '<span class="chip bad">Gönderilmemiş ürün var</span>' : ""}<button class="lnk" data-act="openTable" data-id="${o.id}">Adisyonu aç</button><button class="lnk" data-act="payFrom" data-id="${o.id}">Ödeme al</button></div>`;
         }
         return `<article class="oc ${S.seen.has(o.id) ? "" : "fresh"}" style="--c:${c.c}">
-        <div class="oh"><span class="ch" style="--c:${c.c}">${c.n}</span><span class="oid">${o.code || "#" + o.id}</span><span class="hint" data-since="${o.createdAt}">${ago(o.createdAt)}</span><b class="num" style="margin-left:auto">${fmt(net(o))}</b></div>
-        <div>${who}</div>${sub}${items}${note}${match}${ctrl}</article>`;
+        <div class="oh"><span class="ch" style="--c:${c.c}">${c.n}</span><span class="oid">${o.code || "#" + o.id}</span><span class="hint" data-since="${o.createdAt}">${ago(o.createdAt)}</span>${isQr(o) ? '<span class="chip">QR</span>' : ""}<b class="num" style="margin-left:auto">${fmt(net(o))}</b></div>
+        <div>${who} ${onl}</div>${sub}${items}${note}${match}${ctrl}</article>`;
       }
     </script>
 
     <!-- ============================== js/views/pos.js ============================== -->
     <script>
       // Адисьон стола/телефонного заказа, оплата, окна опций, ikram, перенос.
+
+      // Masanın garsonu: yönetici değiştirebilir; başka garson açtıysa uyarı
+      function waiterBar(o) {
+        const me = S.user,
+          gs = garsons();
+        if (me.role === "admin")
+          return `<label class="wbar"><span>${IC.staff} Masanın garsonu</span><select class="sel" data-act="tableBy" aria-label="Masanın garsonu"><option value="">— Seçilmedi —</option>${[...new Set([...gs.map(g => g.n), o.by].filter(Boolean))]
+            .map(n => `<option ${o.by === n ? "selected" : ""}>${esc(n)}</option>`)
+            .join("")}</select></label>`;
+        if (o.by && o.by !== me.n && (o.items.length || o.custId))
+          return `<div class="wbar warnb">${IC.staff}<span>Bu masanın garsonu <b>${esc(o.by)}</b>. Eklediğiniz ürünler “Ekleyen: ${esc(me.n)}” notuyla kaydedilir.</span></div>`;
+        return o.by ? `<div class="wbar">${IC.staff}<span>Masanın garsonu: <b>${esc(o.by)}</b></span></div>` : "";
+      }
 
       function vPos() {
         const o = S.orders.find(x => x.id === S.activeId);
@@ -7251,7 +7303,7 @@
                 (
                   i,
                   ix,
-                ) => `<div class="line ${i.sent ? "" : "new"} ${i.gift || i.ikram ? "giftline" : ""}"><div class="ln">${esc(iName(i))}${i.gift ? ' <span class="giftchip">Hediye</span>' : ""}${i.ikram ? ' <span class="giftchip">İkram</span>' : ""}${i.mods && i.mods.length ? `<small class="mods">${esc(iMods(i))}</small>` : ""}${i.note ? `<small class="mods">Not: ${esc(i.note)}</small>` : ""}<small>${i.sent ? (i.ready ? "Hazır" : "Mutfakta · " + ago(i.sentAt)) : "Yeni · gönderilmedi"}</small></div>
+                ) => `<div class="line ${i.sent ? "" : "new"} ${i.gift || i.ikram ? "giftline" : ""}"><div class="ln">${esc(iName(i))}${i.gift ? ' <span class="giftchip">Hediye</span>' : ""}${i.ikram ? ' <span class="giftchip">İkram</span>' : ""}${i.mods && i.mods.length ? `<small class="mods">${esc(iMods(i))}</small>` : ""}${i.note ? `<small class="mods">Not: ${esc(i.note)}</small>` : ""}${byOther(i) ? `<small class="addby">Ekleyen: ${esc(i.by)} (başka garson)</small>` : i.by === "Misafir (QR)" ? `<small class="addby qr">QR · misafir sipariş etti</small>` : ""}<small>${i.sent ? (i.ready ? "Hazır" : "Mutfakta · " + ago(i.sentAt)) : "Yeni · gönderilmedi"}</small></div>
          <div class="qty"><button data-act="qty" data-i="${ix}" data-d="-1" aria-label="Azalt">−</button><span class="num">${i.qty}</span><button data-act="qty" data-i="${ix}" data-d="1" aria-label="Arttır" ${i.ikram ? "disabled" : ""}>+</button></div>
          <div class="lnr"><span class="num">${fmt(i.price * i.qty)}</span>${i.sent ? `<button class="lact" data-act="lineAct" data-i="${ix}" title="İkram veya iptal" aria-label="İkram veya iptal">⋯</button>` : `<button class="lact" data-act="lineNote" data-i="${ix}" title="Not ekle" aria-label="Not ekle">✎</button>`}</div></div>`,
               )
@@ -7284,7 +7336,8 @@
         if (o.channel === "masa") {
           const c = o.custId && C(o.custId);
           head =
-            `<h2>Masa ${o.table}</h2><span class="hint" data-since="${o.createdAt}">${ago(o.createdAt)}</span>` +
+            `<h2>Masa ${o.table}</h2><span class="hint" data-since="${o.createdAt}">${ago(o.createdAt)}</span>${paidOnline(o) ? ` <span class="chip ok">Online ödendi</span>` : ""}` +
+            waiterBar(o) +
             (c
               ? `<div class="custchip"><span><b>${esc(c.name)}</b> · bugün ${c.visits + 1}. ziyaret${LOY.on ? ` · sadakat ${loyNext(c)}/${LOY.every}` : ""}${c.note ? `<br><span class="hint">${esc(c.note)}</span>` : ""}</span><button class="btn ghost" data-act="custModal">Değiştir</button></div>`
               : `<button class="btn ghost" style="width:100%" data-act="custModal">${IC.cust} Müşteri bağla</button>`);
@@ -7529,14 +7582,14 @@
           .sort((a, b) => LVL[lvl(a)] - LVL[lvl(b)] || daysLeft(a) - daysLeft(b));
         if (!keys.length) return `<div class="empty">Eşleşen malzeme yok.</div>`;
         const allSel = keys.every(k => S.sel.has(k));
-        return `<table class="mtable"><thead><tr><th class="cb"><input type="checkbox" data-act="selAll" ${allSel ? "checked" : ""} aria-label="Hepsini seç"></th><th>Malzeme</th><th class="r">Stok</th><th class="r">Günlük kullanım</th><th class="r">Ne kadar yeter</th><th class="r">Birim fiyat</th><th>Durum</th><th class="r">İşlem</th></tr></thead><tbody>${keys
+        return `<table class="mtable"><thead><tr><th class="cb"><input type="checkbox" data-act="selAll" ${allSel ? "checked" : ""} aria-label="Hepsini seç"></th><th>Malzeme</th><th class="r">Stok</th><th class="r">Günlük kullanım</th><th class="r">Ne kadar yeter</th><th class="r">Ortalama maliyet</th><th>Durum</th><th class="r">İşlem</th></tr></thead><tbody>${keys
           .map(k => {
             const g = ING[k];
             const l = lvl(k),
               col = l === "ok" ? "var(--ok)" : l === "yakin" ? "var(--warn)" : "var(--bad)",
               pct = Math.min(100, (daysLeft(k) / 7) * 100);
             return `<tr class="${l === "acil" ? "rowbad" : ""} ${S.sel.has(k) ? "selrow" : ""}"><td class="cb"><input type="checkbox" data-act="selIng" data-k="${k}" ${S.sel.has(k) ? "checked" : ""} aria-label="${g.n} seç"></td><td><b>${g.n}</b><br><small class="hint">${g.c}</small></td><td class="r num">${fq(g.s, g.u)}</td><td class="r"><span class="inunit"><input class="price num" id="iu-${k}" data-act="ingUse" data-k="${k}" type="number" min="0" step="${isG(k) ? 0.1 : 1}" value="${+(isG(k) ? g.use / 1000 : g.use).toFixed(2)}" aria-label="${g.n} günlük kullanım"><small>${qLbl(k)}/gün</small></span></td><td class="r num" style="color:${col};font-weight:600">${lasts(k)}</td>
-         <td class="r"><span class="inunit"><input class="price num" id="ip-${k}" data-act="ingPrice" data-k="${k}" type="number" min="0" step="0.5" value="${+uPrice(k).toFixed(2)}" aria-label="${g.n} birim fiyatı"><small>${uLbl(k)}</small></span></td>
+         <td class="r"><span class="inunit"><input class="price num" id="ip-${k}" data-act="ingPrice" data-k="${k}" type="number" min="0" step="0.5" value="${+uPrice(k).toFixed(2)}" aria-label="${g.n} ortalama maliyet"><small>${uLbl(k)}</small></span>${g.last != null && Math.abs(uLast(k) - uPrice(k)) > 0.005 ? `<br><small class="hint">son alış ${fmt2(uLast(k))}</small>` : ""}</td>
          <td><div class="row" style="flex-wrap:nowrap"><div class="lvl" style="flex:1"><i style="width:${pct}%;--c:${col}"></i></div><span class="chip ${l === "acil" ? "bad" : l === "yakin" ? "warn" : "ok"}">${l === "acil" ? "ACİL" : l === "yakin" ? "Yakında" : "Yeterli"}</span></div></td>
          <td><div class="acts"><button class="btn" data-act="stockIn" data-k="${k}">+ Giriş</button><button class="btn ghost" data-act="waste" data-k="${k}">Fire</button><button class="btn ghost iconbtn" data-act="delIng" data-k="${k}" title="Malzemeyi sil" aria-label="${g.n} sil">${IC.trash}</button></div></td></tr>`;
           })
@@ -7556,7 +7609,7 @@
         let body = "";
         if (S.stockTab === "malz") {
           body = `<div class="row" style="margin-bottom:12px"><select class="sel catsel" id="icat" data-act="icat" aria-label="Kategori"><option value="">Tüm kategoriler</option>${ICATS.map(c => `<option ${S.icat === c ? "selected" : ""}>${c}</option>`).join("")}</select><input class="search" id="ingsearch" data-act="sq" placeholder="Malzeme ara (örn. ekmek)" value="${esc(S.sq)}" aria-label="Malzeme ara">
-        <span class="hint" style="flex:1;min-width:200px">Birim fiyatı veya günlük kullanımı tabloda değiştirebilirsiniz. Fiyat değişince ürün fiyatı için öneri gelir.</span><button class="btn danger" id="bulkdel" data-act="bulkDel" ${S.sel.size ? "" : "hidden"}>${IC.trash} Seçilenleri sil (<span id="selcount">${S.sel.size}</span>)</button><button class="btn pri" data-act="ingModal">${IC.plus} Malzeme ekle</button></div>
+        <span class="hint" style="flex:1;min-width:200px">Maliyet ortalama fiyatla hesaplanır: yeni mal gelince (eldeki stok × eski maliyet + gelen × yeni fiyat) ÷ toplam. Maliyeti veya günlük kullanımı tabloda elle de değiştirebilirsiniz.</span><button class="btn danger" id="bulkdel" data-act="bulkDel" ${S.sel.size ? "" : "hidden"}>${IC.trash} Seçilenleri sil (<span id="selcount">${S.sel.size}</span>)</button><button class="btn pri" data-act="ingModal">${IC.plus} Malzeme ekle</button></div>
         <div class="wrapx" id="ingtable">${ingTable(S.sq)}</div>`;
         } else if (S.stockTab === "rec") {
           body = `<p class="hint" style="margin:0 0 12px">Maliyet, malzeme alış fiyatlarından otomatik hesaplanır. Ambalaj sadece paket siparişte stoktan düşer; salon maliyeti ambalajsızdır. FC = maliyet ÷ salon fiyatı (hedef %${SET.fc}).</p>
@@ -7585,8 +7638,8 @@
               sugU = isG(k) ? sug / 1000 : sug;
             return `<tr class="${lvl(k) === "acil" ? "rowbad" : ""}"><td><b>${g.n}</b> ${lvl(k) === "acil" ? '<span class="chip bad">ACİL</span>' : '<span class="chip warn">Yakında</span>'}</td><td class="hint">${esc(supOf(k)?.n || "—")}</td><td class="r num">${fq(g.s, g.u)}</td><td class="r num">${lasts(k)}</td><td class="r num hint">${fq(sug, g.u)}</td>
          <td class="r"><span class="inunit"><input class="price num" id="bq-${k}" data-act="buyCalc" data-k="${k}" type="number" min="0" step="${isG(k) ? 0.5 : 1}" value="${sugU}" aria-label="${g.n} alınan miktar"><small>${qLbl(k)}</small></span></td>
-         <td class="r"><span class="inunit"><input class="price num" id="bp-${k}" data-act="buyCalc" data-k="${k}" type="number" min="0" step="0.5" value="${+uPrice(k).toFixed(2)}" aria-label="${g.n} birim fiyat"><small>${uLbl(k)}</small></span></td>
-         <td class="r num" id="bt-${k}">${fmt(sugU * uPrice(k))}</td><td><button class="btn pri" data-act="recvOne" data-k="${k}">Teslim aldım</button></td></tr>`;
+         <td class="r"><span class="inunit"><input class="price num" id="bp-${k}" data-act="buyCalc" data-k="${k}" type="number" min="0" step="0.5" value="${+uLast(k).toFixed(2)}" aria-label="${g.n} birim fiyat"><small>${uLbl(k)}</small></span></td>
+         <td class="r num" id="bt-${k}">${fmt(sugU * uLast(k))}</td><td><button class="btn pri" data-act="recvOne" data-k="${k}">Teslim aldım</button></td></tr>`;
           })
           .join("")}</tbody></table></div>
         <div class="row" style="margin-top:12px"><button class="btn" data-act="copyBuy">Listeyi kopyala (tedarikçiye göndermek için)</button><button class="btn pri" data-act="recvAll">Tümünü teslim aldım</button></div>`
@@ -7628,8 +7681,8 @@
         });
         const up = changes.some(c => ING[c.k].cost > c.old);
         modal(
-          `<h2>${up ? "Malzemeye zam geldi" : "Malzeme fiyatı değişti"}</h2>
-       <div class="paylist">${changes.map(c => `<div class="split"><span>${ING[c.k].n}</span><span class="num">${fmt(isG(c.k) ? c.old * 1000 : c.old)} → <b>${fmt(uPrice(c.k))}</b> ${uLbl(c.k)}</span></div>`).join("")}</div>
+          `<h2>${up ? "Malzeme maliyeti arttı" : "Malzeme maliyeti değişti"}</h2>
+       <div class="paylist">${changes.map(c => `<div class="split"><span>${ING[c.k].n}${ING[c.k].last != null ? `<br><small class="hint">son alış ${fmt2(uLast(c.k))} ${uLbl(c.k)}</small>` : ""}</span><span class="num">ortalama ${fmt2(isG(c.k) ? c.old * 1000 : c.old)} → <b>${fmt2(uPrice(c.k))}</b> ${uLbl(c.k)}</span></div>`).join("")}</div>
        <p class="hint" style="margin:0">Bu malzemeyi kullanan ${aff.length} ürün. Yeni fiyat tablodaki kuralla hesaplandı: maliyet ÷ %${SET.fc}, uygulama +%${SET.app}, ${SET.step} ₺'ye yuvarlama. İsterseniz değiştirin.</p>
        <div class="wrapx"><table class="mtable sm"><thead><tr><th></th><th>Ürün</th><th class="r">Maliyet</th><th class="r">Salon</th><th class="r">Uygulamalar</th></tr></thead><tbody>${S.pend
          .map((x, i) => {
@@ -7650,7 +7703,7 @@
         const g = ING[k];
         modal(`<h2>${kind === "in" ? "Stok girişi" : "Fire kaydı"}</h2><div class="hint">${g.n} · mevcut ${fq(g.s, g.u)}</div>
        <div class="field"><label class="lbl" for="sq">Miktar (${qLbl(k)})</label><input id="sq" class="num" type="number" min="0" step="${isG(k) ? 0.1 : 1}" value="${kind === "in" ? (isG(k) ? 1 : 10) : isG(k) ? 0.05 : 1}"></div>
-       ${kind === "in" ? `<div class="field"><label class="lbl" for="sp">Birim fiyat (${uLbl(k)})</label><input id="sp" class="num" type="number" min="0" step="0.5" value="${+uPrice(k).toFixed(2)}"></div>` : `<div class="field"><label class="lbl" for="sr">Neden</label><input id="sr" value="Bozuldu"></div>`}
+       ${kind === "in" ? `<div class="field"><label class="lbl" for="sp">Birim fiyat (${uLbl(k)})</label><input id="sp" class="num" type="number" min="0" step="0.5" value="${+uLast(k).toFixed(2)}"><small class="hint">Faturadaki fiyat. Maliyet ortalamayla güncellenir.</small></div>` : `<div class="field"><label class="lbl" for="sr">Neden</label><input id="sr" value="Bozuldu"></div>`}
        <button class="btn pri" data-act="${kind === "in" ? "doIn" : "doWaste"}" data-k="${k}">Kaydet</button><button class="btn ghost" data-act="close">Vazgeç</button>`);
         setTimeout(() => $("#sq")?.select(), 30);
       }
@@ -7740,11 +7793,11 @@
       function recvModal(po) {
         const s = SUPPLIERS.find(x => x.id === po.sup);
         modal(
-          `<h2>Mal kabul · ${esc(s?.n || "Tedarikçi")}</h2><p class="hint" style="margin:0">Gelen miktarı ve faturadaki birim fiyatı kontrol edin. Fiyat değiştiyse malzeme fiyatı güncellenir ve ürün fiyatları için öneri gelir.</p>
+          `<h2>Mal kabul · ${esc(s?.n || "Tedarikçi")}</h2><p class="hint" style="margin:0">Gelen miktarı ve faturadaki birim fiyatı kontrol edin. Malzeme maliyeti ortalama fiyatla güncellenir (eldeki stok + gelen); değiştiyse ürün fiyatları için öneri gelir.</p>
        <div class="wrapx"><table class="mtable sm"><thead><tr><th>Malzeme</th><th class="r">Sipariş</th><th class="r">Gelen</th><th class="r">Birim fiyat</th></tr></thead><tbody>${po.lines
          .map(([k, q, pr], ix) =>
            ING[k]
-             ? `<tr><td>${esc(ING[k].n)}</td><td class="r num hint">${q} ${qLbl(k)}</td><td class="r"><span class="inunit"><input class="price num" id="rq-${ix}" type="number" min="0" step="${isG(k) ? 0.5 : 1}" value="${q}"><small>${qLbl(k)}</small></span></td><td class="r"><span class="inunit"><input class="price num" id="rp-${ix}" type="number" min="0" step="0.5" value="${+(pr ?? uPrice(k)).toFixed(2)}"><small>${uLbl(k)}</small></span></td></tr>`
+             ? `<tr><td>${esc(ING[k].n)}</td><td class="r num hint">${q} ${qLbl(k)}</td><td class="r"><span class="inunit"><input class="price num" id="rq-${ix}" type="number" min="0" step="${isG(k) ? 0.5 : 1}" value="${q}"><small>${qLbl(k)}</small></span></td><td class="r"><span class="inunit"><input class="price num" id="rp-${ix}" type="number" min="0" step="0.5" value="${+(pr ?? uLast(k)).toFixed(2)}"><small>${uLbl(k)}</small></span></td></tr>`
              : "",
          )
          .join("")}</tbody></table></div>
@@ -8248,7 +8301,7 @@
       function modsBody() {
         const ks = Object.keys(ING).sort((a, b) => ING[a].n.localeCompare(ING[b].n, "tr"));
         return (
-          `<p class="hint" style="margin:0 0 12px">Seçenekli ürün adisyona eklenirken seçenekler sorulur (soğansız, pişirme). “Ekstra” seçenekleri her ürünün kendi reçetesinden otomatik gelir; fiyatı malzeme maliyetine göre hesaplanır veya “Ekstralar” sekmesinde elle yazılır. Ek fiyat ürüne eklenir, mutfak ekranında ve adisyonda yazar; “Ekler / Çıkarır” stoktan doğru malzemeyi düşer.</p>` +
+          `<p class="hint" style="margin:0 0 12px">Seçenekli ürün adisyona eklenirken seçenekler sorulur (soğansız, pişirme). “Ekstra” seçenekleri her ürünün kendi reçetesinden otomatik gelir; fiyatı malzeme maliyetine göre hesaplanır veya “Ekstralar” sekmesinde elle yazılır. Ek fiyat ürüne eklenir, mutfak ekranında ve adisyonda yazar; “Çıkarır” (soğansız, sossuz…) fiyatı değiştirmez ama o malzeme stoktan düşülmez ve ürünün maliyetinden çıkar; raporlardaki kâr buna göre hesaplanır. “Ekler” stoktan düşer ve maliyete eklenir.</p>` +
           MODS.map(
             g => `<section class="panel modg"><div class="row"><input class="wzin mgname" value="${esc(g.n)}" data-act="modName" data-g="${g.id}" aria-label="Grup adı"><div class="seg2" role="group"><button class="${g.multi ? "" : "on"}" data-act="modMulti" data-g="${g.id}" data-v="0">Tek seçim</button><button class="${g.multi ? "on" : ""}" data-act="modMulti" data-g="${g.id}" data-v="1">Çoklu seçim</button></div><button class="btn ghost iconbtn" data-act="modDel" data-g="${g.id}" style="margin-left:auto" aria-label="Grubu sil">${IC.trash}</button></div>
         <div class="row"><span class="lbl">Kategoriler</span>${CATS.filter(c => c[0] !== "menuler")
@@ -8961,7 +9014,7 @@
             const r = (pr[i.pid] = pr[i.pid] || { q: 0, c: 0, k: 0 });
             r.q += i.qty;
             r.c += i.price * i.qty;
-            r.k += (costOf(i.pid, o.channel !== "masa") || 0) * i.qty;
+            r.k += lineCost(i, o.channel !== "masa") * i.qty; // seçenekler dahil (soğansız → daha az maliyet)
           }),
         );
         const prs = Object.entries(pr)
@@ -9352,15 +9405,16 @@
         <button class="btn danger" data-act="resetAsk" style="justify-self:start">Sıfırdan başla…</button></section>`;
       }
 
-      // Masa garsonları: her masaya sorumlu garson. Yeni adisyon bu garsonun adıyla açılır; garson kendi masalarını vurgulu görür.
+      // Masa garsonları: garson boş masaya dokunup masayı alır; hesap kapanınca masa boşalır. Yönetici burada değiştirebilir.
       function twaitUI() {
-        const gs = STAFF.filter(x => x.active && x.role === "garson");
-        return `<section class="panel"><div class="split"><h3>Masa garsonları</h3>${gs.length ? `<button class="btn" data-act="twSplit">Masaları eşit dağıt</button>` : ""}</div><p class="hint" style="margin:0">Her masanın sorumlu garsonunu seçin. Masa açılınca adisyon bu garsonun adına açılır, Ana Sayfa'da masanın altında adı görünür; garson kendi masalarını yeşil çerçeveyle görür.</p>
+        const gs = garsons(),
+          open = HALLS.Salon.map(t => tableOrder(t)).filter(o => o && (o.items.length || o.custId));
+        return `<section class="panel"><h3>Masa garsonları</h3><p class="hint" style="margin:0">Garson boş masaya dokununca masa onun olur. Hesap kapanınca masa boşalır, başka garson alabilir. Masanın garsonu dışında biri ürün eklerse ürünün yanında “Ekleyen: …” yazar; arşivde ve Excel'de de görünür. Yönetici masanın garsonunu buradan veya adisyondan değiştirebilir.</p>
         ${
-          gs.length
-            ? `<div class="twgrid">${HALLS.Salon.map(t => `<label class="twcell"><b>${t}</b><select class="sel" data-act="twSet" data-t="${t}" aria-label="${t} garsonu"><option value="">— Yok —</option>${gs.map(g => `<option value="${g.id}" ${TWAIT[t] === g.id ? "selected" : ""}>${esc(g.n)}</option>`).join("")}</select></label>`).join("")}</div>
-        <div class="hint">${gs.map(g => `${esc(g.n)}: ${HALLS.Salon.filter(t => TWAIT[t] === g.id).length} masa`).join(" · ")}</div>`
-            : '<div class="empty">Önce Personel bölümünden garson ekleyin.</div>'
+          open.length
+            ? `<div class="twgrid">${open.map(o => `<label class="twcell"><b>${o.table}</b><select class="sel" data-act="tableBy" data-id="${o.id}" aria-label="${o.table} garsonu"><option value="">— Yok —</option>${[...new Set([...gs.map(g => g.n), o.by].filter(Boolean))].map(n => `<option ${o.by === n ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>`).join("")}</div>
+        <div class="hint">${gs.map(g => `${esc(g.n)}: ${open.filter(o => o.by === g.n).length} masa`).join(" · ")}</div>`
+            : '<div class="empty">Şu an açık masa yok.</div>'
         }</section>`;
       }
     </script>
@@ -9873,13 +9927,13 @@
         return S.orders
           .filter(o => {
             const d = iso(new Date(o.createdAt));
-            if (d < from || d > to || !o.items.length) return false;
-            if (S.arCh && (S.arCh === "paket" ? o.channel === "masa" : S.arCh === "qr" ? !o.paid.some(p => /QR/.test(p.m)) : o.channel !== S.arCh)) return false;
+            if (d < from || d > to || (!o.items.length && !o.voids?.length)) return false;
+            if (S.arCh && (S.arCh === "paket" ? o.channel === "masa" : S.arCh === "qr" ? !isQr(o) : o.channel !== S.arCh)) return false;
             if (S.arSt && o.status !== S.arSt) return false;
             if (!q) return true;
             const c = o.custId ? C(o.custId) : o.customer;
             return norm(
-              [oTitle(o), o.code, "#" + o.id, o.table, c?.name, c?.phone, o.by, o.courier, ...o.items.map(i => P(i.pid)?.name || i.name)].join(" "),
+              [oTitle(o), o.code, "#" + o.id, o.table, c?.name, c?.phone, o.by, o.courier, o.cancelBy, ...o.items.map(i => i.by), ...o.items.map(i => P(i.pid)?.name || i.name)].join(" "),
             ).includes(q);
           })
           .sort((a, b) => b.createdAt - a.createdAt);
@@ -9889,7 +9943,7 @@
         const rows = arsRows(),
           lim = S.arLim || 100,
           sum = rows.filter(o => o.status === "kapali").reduce((t, o) => t + net(o), 0);
-        const chOpts = [["", "Hepsi"], ["masa", "Salon (masa)"], ["paket", "Paket (masa dışı hepsi)"], ["qr", "QR (online ödenen)"], ...Object.entries(CH).filter(([k]) => k !== "masa").map(([k, v]) => [k, v.n])];
+        const chOpts = [["", "Hepsi"], ["masa", "Salon (masa)"], ["paket", "Paket (masa dışı hepsi)"], ["qr", "QR sipariş"], ...Object.entries(CH).filter(([k]) => k !== "masa").map(([k, v]) => [k, v.n])];
         const custOf = o => {
           const c = o.custId ? C(o.custId) : o.customer;
           return c?.name ? esc(c.name) + (c.phone ? `<br><small class="hint num">${esc(c.phone)}</small>` : "") : "";
@@ -9912,14 +9966,14 @@
                 .map(o => {
                   const n = o.items.reduce((t, i) => t + i.qty, 0),
                     st = ARS_ST[o.status] || ["?", ""];
-                  return `<tr><td class="num">${dShort(iso(new Date(o.createdAt)))}<br><small class="hint">${tStr(o.createdAt)}</small></td><td class="num">${esc(o.code || "#" + o.id)}</td><td><span class="ch" style="--c:${CH[o.channel]?.c}">${CH[o.channel]?.pre || CH[o.channel]?.n || o.channel}</span>${o.paid.some(p => /QR/.test(p.m)) ? ' <span class="chip">QR</span>' : ""}</td>
-           <td>${o.channel === "masa" ? `<b>Masa ${esc(o.table)}</b>${o.by ? `<br><small class="hint">${esc(waitersOf(o).join(", "))}</small>` : ""}` : custOf(o) || '<span class="hint">—</span>'}</td>
+                  return `<tr><td class="num">${dShort(iso(new Date(o.createdAt)))}<br><small class="hint">${tStr(o.createdAt)}</small></td><td class="num">${esc(o.code || "#" + o.id)}</td><td><span class="ch" style="--c:${CH[o.channel]?.c}">${CH[o.channel]?.pre || CH[o.channel]?.n || o.channel}</span>${isQr(o) ? ' <span class="chip">QR</span>' : ""}</td>
+           <td>${o.channel === "masa" ? `<b>Masa ${esc(o.table)}</b>${o.by ? `<br><small class="hint">${esc(waitersOf(o).join(", "))}</small>` : ""}${o.items.some(byOther) ? `<br><small class="addby">Başka garson ekledi</small>` : ""}` : custOf(o) || '<span class="hint">—</span>'}</td>
            <td class="hint">${n} ürün · ${esc(
              o.items
                .slice(0, 2)
                .map(i => P(i.pid)?.name || i.name)
                .join(", "),
-           )}${o.items.length > 2 ? "…" : ""}</td><td class="r num">${fmt(net(o))}</td><td class="hint">${[...new Set(o.paid.map(p => p.m))].join(", ") || o.pay || "—"}</td><td><span class="chip ${st[1]}">${st[0]}</span></td>
+           )}${o.items.length > 2 ? "…" : ""}</td><td class="r num">${fmt(net(o))}</td><td class="hint">${paidOnline(o) ? '<span class="chip ok">Online ödendi</span><br>' : ""}${[...new Set(o.paid.map(p => p.m))].join(", ") || o.pay || "—"}</td><td><span class="chip ${st[1]}">${st[0]}</span>${o.status === "iptal" && o.cancelBy ? `<br><small class="hint">İptal eden: ${esc(o.cancelBy)}</small>` : ""}${o.voids?.length ? `<br><small class="addby">${o.voids.reduce((t, v) => t + v.n, 0)} ürün iptal · ${esc([...new Set(o.voids.map(v => v.by))].join(", "))}</small>` : ""}</td>
            <td><button class="btn ghost" data-act="arDet" data-id="${o.id}">Detay</button></td></tr>`;
                 })
                 .join("")}</tbody></table></div>${rows.length > lim ? `<button class="btn" data-act="arMore" style="margin-top:10px">${rows.length - lim} sipariş daha göster</button>` : ""}`
@@ -9938,11 +9992,12 @@
        <div class="field"><span class="lbl">Ürünler</span>${o.items
          .map(
            i =>
-             `<div class="split"><span>${i.qty}× ${esc(P(i.pid)?.name || i.name)}${i.opts?.length ? ` <small class="hint">${esc(i.opts.map(x => x.n || x).join(", "))}</small>` : ""}${i.note ? ` <small class="hint">(${esc(i.note)})</small>` : ""}${i.ikram ? ' <span class="chip">ikram</span>' : ""}</span><span class="num">${fmt((i.price ?? P(i.pid)?.price ?? 0) * i.qty)}</span></div>`,
+             `<div class="split"><span>${i.qty}× ${esc(P(i.pid)?.name || i.name)}${i.opts?.length ? ` <small class="hint">${esc(i.opts.map(x => x.n || x).join(", "))}</small>` : ""}${i.note ? ` <small class="hint">(${esc(i.note)})</small>` : ""}${i.ikram ? ' <span class="chip">ikram</span>' : ""}${byOther(i) ? `<br><small class="addby">Ekleyen: ${esc(i.by)} (başka garson)</small>` : i.by === "Misafir (QR)" ? ' <small class="hint">· QR</small>' : ""}</span><span class="num">${fmt((i.price ?? P(i.pid)?.price ?? 0) * i.qty)}</span></div>`,
          )
          .join("")}<div class="split"><b>Toplam</b><b class="num">${fmt(net(o))}</b></div></div>
-       <div class="field"><span class="lbl">Ödeme</span>${o.paid.length ? o.paid.map(p => `<div class="split"><span>${esc(p.m)}</span><span class="num">${fmt(p.a)}</span></div>`).join("") : `<span class="hint">${esc(o.pay || "Kayıt yok")}</span>`}</div>
-       <div class="field"><span class="lbl">Kim</span><span>${[o.by ? "Açan: " + esc(waitersOf(o).join(", ")) : "", o.courier ? "Kurye: " + esc(o.courier) : "", o.cancelWhy ? "İptal nedeni: " + esc(o.cancelWhy) : ""].filter(Boolean).join(" · ") || '<span class="hint">—</span>'}</span></div>
+       ${o.voids?.length ? `<div class="field"><span class="lbl">İptal edilen ürünler</span>${o.voids.map(v => `<div class="split"><span>${v.n}× ${esc(v.name)}${v.qr ? ' <span class="chip">QR</span>' : ""} <small class="hint">· ${esc(v.why)}</small></span><span><b>İptal eden: ${esc(v.by)}</b> <small class="hint num">${tStr(v.t)}</small></span></div>`).join("")}</div>` : ""}
+       <div class="field"><span class="lbl">Ödeme${paidOnline(o) ? ' <span class="chip ok">Online ödendi</span>' : ""}</span>${o.paid.length ? o.paid.map(p => `<div class="split"><span>${esc(p.m)}</span><span class="num">${fmt(p.a)}</span></div>`).join("") : `<span class="hint">${esc(o.pay || "Kayıt yok")}</span>`}</div>
+       <div class="field"><span class="lbl">Kim</span><span>${[o.by ? "Masanın garsonu: " + esc(o.by) : "", o.waiters?.length ? "Diğer garsonlar: " + esc(o.waiters.join(", ")) : "", isQr(o) ? "QR sipariş" : "", o.courier ? "Kurye: " + esc(o.courier) : "", o.cancelBy ? "<b>İptal eden: " + esc(o.cancelBy) + "</b>" : "", o.cancelReason || o.cancelWhy ? "İptal nedeni: " + esc(o.cancelReason || o.cancelWhy) : ""].filter(Boolean).join(" · ") || '<span class="hint">—</span>'}</span></div>
        <button class="btn ghost" data-act="close">Kapat</button>`,
           true,
         );
@@ -9958,7 +10013,7 @@
         XLSX.utils.book_append_sheet(
           wb,
           XLSX.utils.aoa_to_sheet([
-            ["Tarih", "Saat", "Sipariş", "Kanal", "Masa", "Müşteri", "Telefon", "Ürünler", "Tutar (₺)", "Ödeme", "Durum", "Garson", "Kurye"],
+            ["Tarih", "Saat", "Sipariş", "Kanal", "Masa", "Müşteri", "Telefon", "Ürünler", "Tutar (₺)", "Ödeme", "Online ödendi", "Durum", "İptal eden", "İptal nedeni", "Masanın garsonu", "Başka garsonun eklediği", "İptal edilen ürünler (kim)", "Kurye"],
             ...rows.map(o => {
               const c = o.custId ? C(o.custId) : o.customer;
               return [
@@ -9972,8 +10027,13 @@
                 o.items.map(i => `${i.qty}× ${P(i.pid)?.name || i.name}`).join(", "),
                 Math.round(net(o)),
                 [...new Set(o.paid.map(p => p.m))].join(", ") || o.pay || "",
+                paidOnline(o) ? "Evet" : "",
                 (ARS_ST[o.status] || ["?"])[0],
-                waitersOf(o).join(", "),
+                o.cancelBy || "",
+                o.cancelReason || o.cancelWhy || "",
+                o.by || "",
+                o.items.filter(byOther).map(i => `${i.qty}× ${P(i.pid)?.name || i.name} (${i.by})`).join(", "),
+                (o.voids || []).map(v => `${v.n}× ${v.name} · ${v.by} · ${v.why}`).join("; "),
                 o.courier || "",
               ];
             }),
@@ -10426,12 +10486,17 @@
           S.csel = [...set];
           $("#custtable").innerHTML = custTable(custRows(S.cq));
         }
-        if (a === "twSet") {
-          const t = b.dataset.t,
-            v = b.value ? +b.value : null;
-          if (v) TWAIT[t] = v;
-          else delete TWAIT[t];
-          act("Masa garsonu", `${t} → ${v ? SF(v).n : "yok"}`, "", "Ayarlar");
+        // Yönetici masanın garsonunu değiştirir (adisyondan veya Ayarlar → İşletme ve masalar)
+        if (a === "tableBy") {
+          const o = b.dataset.id ? S.orders.find(x => x.id === +b.dataset.id) : S.orders.find(x => x.id === S.activeId);
+          if (!o) return;
+          const old = o.by,
+            v = b.value;
+          o.by = v;
+          o.waiters = (o.waiters || []).filter(n => n !== v);
+          if (old && old !== v && !o.waiters.includes(old)) o.waiters.push(old);
+          act("Masanın garsonu değişti", `Masa ${o.table} · ${old || "yok"} → ${v || "yok"}`, "", "Sipariş");
+          toast(`Masa ${o.table}: garson ${v || "yok"}`);
           render();
         }
         if (a === "arF") {
@@ -10828,10 +10893,17 @@
         switch (a) {
           case "table": {
             let t = tableOrder(b.dataset.t);
+            const free = !t || (!t.items.length && !t.custId);
             if (!t) {
               t = mk({ channel: "masa", table: b.dataset.t });
-              if (tWaiter(b.dataset.t)) t.by = tWaiter(b.dataset.t).n; // masanın sorumlu garsonu
               S.orders.push(t);
+            }
+            // Boş masayı açan garson masanın sorumlusu olur (hesap kapanınca masa boşalır)
+            if (free && S.user.role === "garson") {
+              if (t.by !== S.user.n) act("Masayı aldı", `Masa ${t.table} · ${S.user.n}`, "", "Sipariş");
+              t.by = S.user.n;
+              t.waiters = [];
+              toast(`Masa ${t.table} artık sizde`);
             }
             S.activeId = t.id;
             S.view = "pos";
@@ -10865,6 +10937,23 @@
             q.status = "red";
             q.why = $("#qr-why").value;
             q.by = S.user.n;
+            // Arşivde ve raporda görünsün: reddedilen QR siparişi iptal kaydı olarak saklanır
+            S.orders.push(
+              mk({
+                channel: "masa",
+                table: q.table,
+                by: "",
+                status: "iptal",
+                qr: true,
+                online: q.paid,
+                createdAt: q.t,
+                closedAt: now(),
+                cancelBy: S.user.n,
+                cancelReason: "QR reddedildi · " + q.why,
+                paid: q.paid ? [{ m: "Online (QR) · iade edilecek", a: q.total }] : [],
+                items: q.items.map(i => ({ pid: i.pid, qty: i.qty, note: i.note, price: P(i.pid)?.price || 0, sent: false, by: "Misafir (QR)" })),
+              }),
+            );
             act("QR sipariş reddedildi", `Masa ${q.table} · ${fmt(q.total)} · ${q.why}${q.paid ? " · iade" : ""}`, "", "Sipariş");
             modal("");
             toast(`Masa ${q.table}: QR sipariş reddedildi${q.paid ? ", ödeme iade edilecek" : ""}`);
@@ -11013,6 +11102,8 @@
             const x = byId();
             x.status = "iptal";
             x.closedAt = now();
+            x.cancelBy = S.user.n;
+            x.cancelReason = x.cancelReason || "Reddedildi";
             toast("Sipariş reddedildi");
             act("Sipariş reddedildi", `${CH[x.channel].n} ${x.code || "#" + x.id}`, "", "Sipariş");
             break;
@@ -11121,6 +11212,7 @@
             x.status = "iptal";
             x.closedAt = now();
             x.cancelReason = $("#cr").value;
+            x.cancelBy = S.user.n;
             act("Sipariş iptal", `${x.code || "#" + x.id} · ${x.cancelReason}`);
             modal("");
             toast(`Sipariş iptal edildi · ${x.cancelReason}`);
@@ -11197,6 +11289,8 @@
               } else {
                 if (k === "iade") moveStock([{ ...i, qty: n }], 1, "İptal: " + where, o.channel !== "masa");
                 else WASTE.push({ t: now(), pid: i.pid, qty: n, cost: uc * n, why, u: S.user.n });
+                // arşivde kim, neyi, neden iptal etti görünsün (QR'dan gelen ürün de)
+                (o.voids = o.voids || []).push({ t: now(), n, name: nm, by: S.user.n, why: why + (k === "iade" ? "" : " · fire"), qr: i.by === "Misafir (QR)" });
                 i.qty -= n;
                 if (i.qty <= 0) o.items.splice(ix, 1);
                 act(k === "iade" ? "Ürün iptal (stoka döndü)" : "Ürün iptal (fire)", `${n}× ${nm} · ${where} · ${why}`, ok);
@@ -11755,9 +11849,8 @@
               qIn = Math.max(0, +$("#sq").value || 0),
               pIn = Math.max(0, +$("#sp").value || 0),
               q = isG(k) ? qIn * 1000 : qIn,
-              old = ING[k].cost,
               nc = isG(k) ? pIn / 1000 : pIn;
-            ING[k].s += q;
+            const ch = stockIn(k, q, nc);
             LOG.unshift({ t: now(), k, d: q, why: "Stok girişi" });
             GIDER.push({
               id: ++GID,
@@ -11767,10 +11860,9 @@
               note: `${ING[k].n} · ${qIn} ${qLbl(k)}`,
             });
             modal("");
-            if (Math.abs(nc - old) > 1e-9) {
-              ING[k].cost = nc;
+            if (ch) {
               render();
-              costChange([{ k, old }]);
+              costChange([ch]);
               return;
             }
             toast(`${ING[k].n}: +${fq(q, ING[k].u)}`);
@@ -11994,12 +12086,9 @@
                 nc = isG(k) ? pr / 1000 : pr;
               tt += q * pr;
               if (!q) return;
-              ING[k].s += qty;
+              const ch = stockIn(k, qty, nc);
               LOG.unshift({ t: now(), k, d: qty, why: "Tedarikçi teslimatı · " + (s?.n || "") });
-              if (Math.abs(nc - ING[k].cost) > 1e-9) {
-                changes.push({ k, old: ING[k].cost });
-                ING[k].cost = nc;
-              }
+              if (ch) changes.push(ch);
             });
             tt = Math.round(tt);
             GIDER.push({
@@ -12770,13 +12859,6 @@
 
       function settingsActions(a, b, o, byId, e) {
         switch (a) {
-          case "twSplit": {
-            const gs = STAFF.filter(x => x.active && x.role === "garson");
-            HALLS.Salon.forEach((t, i) => (TWAIT[t] = gs[Math.floor((i * gs.length) / HALLS.Salon.length)].id));
-            act("Masa garsonları dağıtıldı", gs.map(g => `${g.n}: ${HALLS.Salon.filter(t => TWAIT[t] === g.id).join(", ")}`).join(" · "), "", "Ayarlar");
-            toast("Masalar garsonlara eşit dağıtıldı");
-            break;
-          }
           case "tst": {
             // Bağlantı testi: önce “Kontrol ediliyor…”, sonra sonuç (demo: cihazın/platformun açık olup olmadığına göre)
             const id = b.dataset.id;
