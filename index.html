@@ -4311,7 +4311,7 @@
         icat: "",
         sel: new Set(),
         setTab: "ozet",
-        qrBase: "", // menü adresi: restoranın kendi alan adı alınınca Ayarlar → Menü ve QR'da yazılır
+        qrBase: "https://samirashobibulloeva-ops.github.io/nazura-qr/", // QR menü adresi (restoranın kendi alan adı alınınca Ayarlar → Menü ve QR’da değiştirilir)
         qrList: [],
         repPass: "2580",
         autoPrint: true,
@@ -5577,7 +5577,7 @@
         S.p14 = true;
         if (d.S) {
           ["rname", "qrBase", "repPass", "autoAccept", "lastBackup", "p14"].forEach(k => {
-            if (d.S[k] != null && !(k === "qrBase" && /menu\.nazura\.com\.tr|claude\.ai\/artifact/.test(d.S[k]))) S[k] = d.S[k];
+            if (d.S[k] != null && !(k === "qrBase" && !d.S[k]) && !(k === "qrBase" && /menu\.nazura\.com\.tr|claude\.ai\/artifact/.test(d.S[k]))) S[k] = d.S[k];
           });
           if (Array.isArray(d.S.qrList)) S.qrList = d.S.qrList;
           if (Array.isArray(d.S.orders)) S.orders.splice(0, S.orders.length, ...d.S.orders);
