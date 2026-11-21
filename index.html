@@ -26,6 +26,7 @@
     js/logic/audit.js          Takip: периоды (день/неделя/месяц/год), категории событий, статистика за период.
     js/logic/finance.js        Напоминания об оплате и расчёт кассы.
     js/logic/storage.js        Сохранение данных в браузере и восстановление из резервной копии.
+    js/logic/server.js         Sunucu (Supabase) bağlantısı: menü ve fiyatlar QR menüye gider, ödenmiş QR siparişler buraya gelir.
 
   ДАННЫЕ — меню, ингредиенты, рецепты, клиенты, персонал, настройки (здесь меняют блюда и цены)
     js/data/menu.js            Меню: категории, блюда и цены, комбо, опции, аллергены, правило цены SET.
@@ -5044,7 +5045,7 @@
           S.orders.push(o);
         }
         q.items.forEach(i => {
-          for (let k = 0; k < i.qty; k++) addLine(o, { pid: i.pid, note: i.note, by: "Misafir (QR)" });
+          for (let k = 0; k < i.qty; k++) addLine(o, { pid: i.pid, note: i.note, mods: i.mods, by: "Misafir (QR)" });
         });
         if (q.paid) {
           o.paid.push({ m: "Online (QR)", a: q.total });
@@ -5055,6 +5056,7 @@
         o.stage = "alindi";
         q.status = "onay";
         q.by = how === "otomatik" ? "Otomatik" : S.user?.n;
+        if (q.srv) srvSetStatus(q.srv, "accepted", q.by);
         act("QR sipariş onaylandı", `Masa ${q.table} · ${fmt(q.total)}`, "", "Sipariş");
       }
     </script>
@@ -5510,6 +5512,7 @@
           KASA,
           INTEG,
           SMEAL,
+          SRV,
           PRINTROUTE,
           KVKK,
           EXTRA,
@@ -5560,7 +5563,7 @@
             DEV,
             PLATFORMS,
           },
-          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, SMEAL };
+          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, SMEAL, SRV };
         Object.entries(A).forEach(([k, a]) => {
           if (Array.isArray(d[k])) a.splice(0, a.length, ...d[k]);
         });
@@ -5630,6 +5633,139 @@
           }
         }, 400);
       }
+    </script>
+
+    <!-- ============================== js/logic/server.js ============================== -->
+    <script>
+      // Sunucu (Supabase) bağlantısı: menü ve fiyatlar QR menüye gider, ödenmiş QR siparişler buraya gelir.
+      // Tarayıcıda sadece GENEL (publishable) anahtar ve restoranın “senkron anahtarı” kullanılır.
+      // Senkron anahtarı sadece bu cihazda saklanır (kodda ve GitHub'da yoktur). Gizli (secret) anahtar hiç kullanılmaz.
+      const SRV = {
+        url: "https://dpzagxvqodrejaekbsqi.supabase.co",
+        key: "sb_publishable_pxK4QbPYc431nAzSBGLwcQ_f3YQC0QV",
+        sync: "", // Ayarlar → Sunucu'da yapıştırılır
+        on: false,
+        lastPush: 0,
+        lastPull: 0,
+        err: "",
+        hash: "",
+        pend: [], // gönderilemeyen onay/red bildirimleri (internet gelince tekrar)
+      };
+
+      const srvReady = () => SRV.on && !!SRV.sync && !!SRV.url && !!SRV.key;
+
+      async function srvRpc(fn, args) {
+        const r = await fetch(SRV.url.replace(/\/$/, "") + "/rest/v1/rpc/" + fn, {
+          method: "POST",
+          headers: { apikey: SRV.key, "Content-Type": "application/json" },
+          body: JSON.stringify(args),
+        });
+        const body = r.status === 204 ? null : await r.json().catch(() => null);
+        if (!r.ok) throw new Error(body?.message || "HTTP " + r.status);
+        return body;
+      }
+
+      // QR'da seçilen seçenek kimlikleri (pis-1, ex-kofte) → adisyon satırı seçenekleri (fiyatıyla)
+      function qrMods(pid, opts) {
+        const p = P(pid);
+        if (!p || !opts?.length) return [];
+        const gs = modsFor(p),
+          ex = extrasFor(p),
+          out = [];
+        opts.forEach(id => {
+          if (id.startsWith("ex-")) {
+            const e = ex.find(x => x.k === id.slice(3));
+            if (e) out.push({ g: "ex", n: e.n, p: e.p, add: [[e.k, e.q]] });
+            return;
+          }
+          const j = id.lastIndexOf("-"),
+            g = gs.find(x => x.id === id.slice(0, j)),
+            op = g?.opts[+id.slice(j + 1)];
+          if (op) out.push({ g: g.id, n: op.n, p: op.p || 0 });
+        });
+        return out;
+      }
+
+      // Menü + masalar + QR kuralları sunucuya (değiştiyse)
+      async function srvPushMenu(force) {
+        if (!srvReady()) return;
+        const menu = qrMenuJson(),
+          tables = Object.values(HALLS).flat(),
+          cfg = { qr_on: QRORD.on, approve: QRORD.approve, one_pending: QRORD.onePending, max_items: QRORD.maxItems };
+        const h = JSON.stringify([menu.categories, menu.items, tables, cfg]);
+        if (!force && h === SRV.hash) return;
+        try {
+          await srvRpc("publish_menu", { p_key: SRV.sync, p_menu: menu, p_tables: tables, p_cfg: cfg });
+          SRV.hash = h;
+          SRV.lastPush = now();
+          SRV.err = "";
+          if (force) toast("Menü sunucuya gönderildi");
+        } catch (e) {
+          SRV.err = e.message === "bad_key" ? "Senkron anahtarı yanlış" : "Menü gönderilemedi (" + e.message + ")";
+          if (force) toast(SRV.err);
+        }
+      }
+
+      // Ödenmiş QR siparişleri al → “Onay bekliyor” paneline düşer
+      async function srvPullOrders() {
+        if (!srvReady()) return;
+        try {
+          const list = await srvRpc("nazura_qr_orders", { p_key: SRV.sync });
+          SRV.lastPull = now();
+          SRV.err = "";
+          let added = 0;
+          (list || []).forEach(o => {
+            if (QRQ.some(q => q.srv === o.id)) return;
+            const q = {
+              id: ++QRID,
+              srv: o.id,
+              code: o.code,
+              table: o.table_no,
+              guest: o.guest_name,
+              note: o.note,
+              items: o.items.map(l => ({
+                pid: l.item_id,
+                qty: l.qty,
+                note: l.note || "",
+                mods: qrMods(l.item_id, l.opts),
+                name: l.name + (l.options?.length ? " (" + l.options.join(", ") + ")" : ""),
+              })),
+              total: o.total / 100,
+              paid: true,
+              t: Date.parse(o.created_at) || now(),
+              status: "bekliyor",
+            };
+            QRQ.unshift(q);
+            added++;
+            act("QR sipariş geldi", `Masa ${q.table} · ${o.code} · ${fmt(q.total)} · online ödendi`, "", "Sipariş", "Misafir (QR)");
+            if (!QRORD.approve) qrApprove(q, "otomatik");
+          });
+          // bekleyen onay/red bildirimlerini tekrar dene
+          for (const x of SRV.pend.splice(0)) await srvSetStatus(x.id, x.st, x.by, x.why);
+          if (added) {
+            toast(`${added} yeni QR sipariş`);
+            render();
+          }
+        } catch (e) {
+          SRV.err = e.message === "bad_key" ? "Senkron anahtarı yanlış" : "Sunucuya ulaşılamadı";
+        }
+      }
+
+      // Garson onayladı / reddetti → misafirin ekranında görünür
+      async function srvSetStatus(id, st, by, why) {
+        try {
+          await srvRpc("nazura_set_status", { p_key: SRV.sync, p_id: id, p_status: st, p_by: by || "", p_reason: why || "" });
+        } catch (e) {
+          SRV.pend.push({ id, st, by, why });
+        }
+      }
+
+      // Döngü: her 5 sn sipariş kontrolü, değişiklik varsa menü gönderimi
+      setInterval(() => {
+        if (!srvReady() || document.hidden) return;
+        srvPullOrders();
+        srvPushMenu();
+      }, 5000);
     </script>
 
     <!-- ============================== js/data/menu.js ============================== -->
@@ -7301,7 +7437,7 @@
         return `<section class="qrq" aria-label="QR siparişleri"><div class="sechead"><h2 class="sec">QR siparişleri · onay bekliyor</h2><span class="hint">Masaya bakıp misafirin orada olduğunu görün, sonra onaylayın.</span></div><div class="qrqlist">${qp
           .map(
             q => `<article class="qrqc"><div class="split"><b>Masa ${esc(q.table)}</b><span class="hint" data-since="${q.t}">${ago(q.t)}</span></div>
-         <div class="oitems">${q.items.map(i => `${i.qty}× ${esc(P(i.pid)?.name || "?")}${i.note ? ` <small>(${esc(i.note)})</small>` : ""}`).join(", ")}</div>
+         <div class="oitems">${q.items.map(i => `${i.qty}× ${esc(P(i.pid)?.name || "?")}${i.mods?.length ? ` <small>· ${esc(i.mods.map(m => m.n).join(", "))}</small>` : ""}${i.note ? ` <small>(${esc(i.note)})</small>` : ""}`).join(", ")}${q.code ? ` <span class="chip">${esc(q.code)}</span>` : ""}${q.guest ? ` <small class="hint">${esc(q.guest)}</small>` : ""}</div>
          <div class="split"><b class="num">${fmt(q.total)}</b>${q.paid ? '<span class="chip ok">Online ödendi</span>' : '<span class="chip warn">Ödenmedi</span>'}</div>
          <div class="row"><button class="btn pri" data-act="qrOk" data-id="${q.id}">Onayla, mutfağa gönder</button><button class="btn ghost danger" data-act="qrNo" data-id="${q.id}">Reddet</button></div></article>`,
           )
@@ -9472,11 +9608,27 @@
         return body + qrSyncPanel();
       }
 
-      // QR menü fiyat güncelleme (sunucu kurulana kadar yarı otomatik)
+      // Sunucu (Supabase): fiyatlar QR menüye kendiliğinden gider, ödenmiş QR siparişler buraya gelir
       function qrSyncPanel() {
-        return `<section class="panel" style="margin-top:14px"><div class="split"><h3>QR menüyü güncelle</h3>${S.qrSyncAt ? `<span class="hint">Son: ${dtStr(S.qrSyncAt)}</span>` : ""}</div>
-        <p class="hint" style="margin:0">Fiyat değiştirdiyseniz, ürün eklediyseniz veya bir ürünü satışa kapattıysanız QR menünün de bilmesi gerekir. Şimdilik: düğmeye basın, inen <b>menu.json</b> dosyasını GitHub'daki <b>nazura-qr</b> deposuna yükleyin (Add file → Upload files → Commit). 1–2 dakika içinde QR menüde yeni fiyatlar görünür. Sunucu kurulunca bu adım kalkar, her değişiklik QR menüye anında gider.</p>
-        <div class="row"><button class="btn pri" data-act="qrSync">${IC.dl || ""}QR menüyü güncelle (menu.json indir)</button></div></section>`;
+        const ok = srvReady();
+        const st = !SRV.on
+          ? '<span class="chip">Kapalı</span>'
+          : SRV.err
+            ? `<span class="chip bad">${esc(SRV.err)}</span>`
+            : SRV.lastPull
+              ? '<span class="chip ok">Bağlı</span>'
+              : '<span class="chip warn">Bağlanıyor…</span>';
+        return `<section class="panel" style="margin-top:14px"><div class="split"><h3>Sunucu bağlantısı (QR menü ve QR sipariş)</h3>${st}</div>
+        <p class="hint" style="margin:0">Bağlıyken fiyat, “satışta yok” ve yeni ürünler QR menüye <b>kendiliğinden</b> gider; misafirin QR'dan verip ödediği siparişler Ana Sayfa'daki <b>Onay bekliyor</b> paneline düşer. Bağlantı sadece bu cihazda kurulur: siparişleri karşılayacak tablette açın.</p>
+        ${
+          ok
+            ? `<div class="paylist"><div class="split"><span>Menü son gönderim</span><b>${SRV.lastPush ? dtStr(SRV.lastPush) : "—"}</b></div><div class="split"><span>Sipariş son kontrol</span><b>${SRV.lastPull ? dtStr(SRV.lastPull) : "—"}</b></div></div>
+        <div class="row"><button class="btn pri" data-act="srvPush">Menüyü şimdi gönder</button><button class="btn ghost" data-act="srvOff">Bağlantıyı kapat</button></div>`
+            : `<div class="gform"><div class="field wide2"><label class="lbl" for="srv-k">Senkron anahtarı</label><input id="srv-k" type="password" autocomplete="off" placeholder="Supabase kurulumunun sonunda çıkan uzun anahtar" value="${esc(SRV.sync)}"><small class="hint">Gizli: kimseyle paylaşmayın. Sadece bu cihazda saklanır, yedek dosyasına yazılmaz.</small></div></div>
+        <div class="err" id="srv-err"></div><div class="row"><button class="btn pri" data-act="srvOn">Bağlan</button></div>`
+        }
+        <details class="paymore"><summary>Sunucu yoksa: menüyü dosya olarak indir</summary><p class="hint" style="margin:0">İnen <b>menu.json</b> dosyasını GitHub'daki <b>nazura-qr</b> deposuna yükleyin. Sunucu bağlıyken buna gerek yok.</p>
+        <div class="row"><button class="btn" data-act="qrSync">menu.json indir</button></div></details></section>`;
       }
 
       // Ayarlar: önce “Genel bakış” (neyin hazır olduğu), sonra kurulum sırasına göre gruplar
@@ -11294,6 +11446,7 @@
             q.status = "red";
             q.why = $("#qr-why").value;
             q.by = S.user.n;
+            if (q.srv) srvSetStatus(q.srv, "rejected", q.by, q.why);
             // Arşivde ve raporda görünsün: reddedilen QR siparişi iptal kaydı olarak saklanır
             S.orders.push(
               mk({
@@ -11308,7 +11461,7 @@
                 cancelBy: S.user.n,
                 cancelReason: "QR reddedildi · " + q.why,
                 paid: q.paid ? [{ m: "Online (QR) · iade edilecek", a: q.total }] : [],
-                items: q.items.map(i => ({ pid: i.pid, qty: i.qty, note: i.note, price: P(i.pid)?.price || 0, sent: false, by: "Misafir (QR)" })),
+                items: q.items.map(i => ({ pid: i.pid, qty: i.qty, note: i.note, mods: i.mods, price: (P(i.pid)?.price || 0) + (i.mods || []).reduce((t, m) => t + (m.p || 0), 0), sent: false, by: "Misafir (QR)" })),
               }),
             );
             act("QR sipariş reddedildi", `Masa ${q.table} · ${fmt(q.total)} · ${q.why}${q.paid ? " · iade" : ""}`, "", "Sipariş");
@@ -13308,6 +13461,35 @@
 
       function settingsActions(a, b, o, byId, e) {
         switch (a) {
+          case "srvOn": {
+            const k = $("#srv-k").value.trim();
+            if (k.length < 32) {
+              $("#srv-err").textContent = "Anahtar eksik görünüyor. Supabase'te çıkan uzun anahtarın tamamını yapıştırın.";
+              return;
+            }
+            SRV.sync = k;
+            SRV.on = true;
+            SRV.hash = "";
+            SRV.err = "";
+            act("Sunucu bağlantısı açıldı", SRV.url.replace(/^https:\/\//, ""), "", "Ayarlar");
+            srvPushMenu(true).then(() => {
+              if (SRV.err) {
+                SRV.on = false;
+                toast(SRV.err);
+              } else toast("Sunucuya bağlandı: menü gönderildi");
+              srvPullOrders().then(render);
+              render();
+            });
+            return;
+          }
+          case "srvPush":
+            srvPushMenu(true).then(render);
+            return;
+          case "srvOff":
+            SRV.on = false;
+            act("Sunucu bağlantısı kapatıldı", "", "", "Ayarlar");
+            toast("Sunucu bağlantısı kapatıldı");
+            break;
           case "qrSync": {
             const m = qrMenuJson();
             saveFile("menu.json", JSON.stringify(m, null, 1), "application/json");
@@ -13772,7 +13954,9 @@
             break;
           case "backupDl": {
             const name = `${S.rname}-yedek-${T0}.json`.replace(/\s+/g, "-");
-            saveFile(name, new Blob([JSON.stringify(snapshot(), null, 1)], { type: "application/json" }), "application/json");
+            const snap = snapshot();
+            if (snap.SRV) snap.SRV = { ...snap.SRV, sync: "" }; // senkron anahtarı yedek dosyasına yazılmaz
+            saveFile(name, new Blob([JSON.stringify(snap, null, 1)], { type: "application/json" }), "application/json");
             act("Yedek indirildi", name);
             S.lastBackup = now();
             render();
