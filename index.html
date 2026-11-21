@@ -8242,6 +8242,10 @@
       };
       function waListModal(t, rs, keep) {
         S.waKeep = keep;
+        // seçilip de gitmeyenler: nedeniyle birlikte göster
+        const info = keep.who === "selinfo" || keep.who === "info",
+          skip = keep.who === "sel" || keep.who === "selinfo" ? CUSTOMERS.filter(c => (S.csel || []).includes(c.id) && !rs.includes(c)) : [];
+        const why = c => (!c.phone ? "Telefonu yok" : info ? "KVKK onayı yok" : "Kampanya izni yok (İYS)");
         modal(
           `<h2>WhatsApp'ta tek tek gönder</h2><p class="hint" style="margin:0">Her satırdaki düğme WhatsApp'ı o müşterinin kendi mesajıyla açar; WhatsApp'ta “Gönder”e basın, sonra buraya dönüp sıradakine geçin. Gönderilenler ✓ ile işaretlenir.</p>
        <div class="wrapx"><table class="mtable sm"><thead><tr><th>Müşteri</th><th>Telefon</th><th></th></tr></thead><tbody>${rs
@@ -8249,7 +8253,8 @@
            c =>
              `<tr id="wa-${c.id}"><td><b>${esc(c.name)}</b></td><td class="num">${esc(c.phone)}</td><td><a class="btn pri" href="${waLink(c.phone, fillTpl(t, c))}" target="_blank" rel="noopener" data-act="waSent" data-id="${c.id}">WhatsApp'ta aç</a></td></tr>`,
          )
-         .join("")}</tbody></table></div>
+         .join("")}${skip.map(c => `<tr class="dim"><td><b>${esc(c.name)}</b></td><td class="num">${esc(c.phone || "—")}</td><td><span class="chip warn">${why(c)}</span></td></tr>`).join("")}</tbody></table></div>
+       ${skip.length && !info ? `<p class="hint" style="margin:0">Kampanya izni olmayan müşteriye indirim/reklam mesajı gönderilemez (İYS). İzin alınca müşteri kartından “Kampanya” işaretlenir. Reklam olmayan bir duyuru ise “Kime” alanında <b>bilgilendirme</b> seçin.</p>` : ""}
        <button class="btn pri" data-act="waDone" data-n="${rs.length}">Bitti, kaydet</button><button class="btn ghost" data-act="waBack">← Mesaja dön</button>`,
           true,
         );
