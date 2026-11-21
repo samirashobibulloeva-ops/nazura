@@ -4102,6 +4102,9 @@
 
       /* ===== Пакет правок 14 ===== */
       .addby.sm { color: var(--accent); }
+      /* gerçek QR menü önizlemesi (iframe) */
+      .phone.live { padding: 0; background: #fff; }
+      .phone.live iframe { border: 0; width: 100%; height: 100%; display: block; }
     </style>
   </head>
   <body>
@@ -8711,7 +8714,17 @@
         if (sep && !pr.dataset.touched) pr.value = ceilTo(sep * 0.9);
       }
 
+      // QR önizleme: gerçek QR menü sitesi telefon çerçevesinde açılır (misafirin gördüğünün aynısı).
+      // Masa numarası verilmez: önizlemeden sipariş verilemez, sadece menü görünür.
+      // Claude önizlemesi gibi dış siteyi çerçevede açamayan yerlerde eski taslak + bağlantı gösterilir.
+      const canFrame = () => location.protocol === "file:" || /github\.io$|^localhost$|^127\./.test(location.hostname);
       function qrPhone() {
+        if (S.qrBase && canFrame())
+          return `<div class="phone live" aria-label="QR menü önizleme"><iframe src="${esc(S.qrBase)}" title="QR menü önizleme"></iframe></div>
+        <div class="row" style="justify-content:space-between"><span class="hint">Misafirin gördüğü menünün aynısı. Fiyat değişince birkaç saniye içinde burada da görünür.</span><a class="btn sm ghost" href="${esc(S.qrBase)}" target="_blank" rel="noopener">Yeni sekmede aç</a></div>`;
+        return qrPhoneDraft() + (S.qrBase ? `<a class="btn sm ghost" href="${esc(S.qrBase)}" target="_blank" rel="noopener">Gerçek QR menüyü aç</a>` : "");
+      }
+      function qrPhoneDraft() {
         const cs = CATS.filter(([id]) => AP().some(p => p.cat === id));
         return `<div class="phone" aria-label="QR menü önizleme"><div class="ph-top"><b>${esc(S.rname)}</b><span>Menü</span></div><div class="ph-cats">${cs.map(([, n]) => `<span>${esc(n)}</span>`).join("")}</div>
         <div class="ph-body">${cs
