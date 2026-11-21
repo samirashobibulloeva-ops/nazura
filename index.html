@@ -4098,6 +4098,9 @@
       .wbar .sel { flex: 1; min-height: 40px; }
       .wbar.warnb { color: var(--fg); background: color-mix(in srgb, var(--warn) 14%, transparent); border-radius: 10px; padding: 8px 10px; }
       .tile .chip.onl { align-self: flex-start; font-size: 11px; padding: 2px 8px; }
+
+      /* ===== Пакет правок 14 ===== */
+      .addby.sm { color: var(--accent); }
     </style>
   </head>
   <body>
@@ -4575,6 +4578,44 @@
         return out;
       }
       const hasOptions = p => !!(p && (p.combo || modsFor(p).length || extrasFor(p).length));
+
+      // QR menü dosyası (menu.json): QR sitesi açılırken bu dosyayı okur. Fiyat, “satışta yok” ve seçenekler buradan gelir.
+      // Sunucu kurulana kadar: Ayarlar → Menü ve QR → “QR menüyü güncelle” → dosyayı nazura-qr deposuna yükle.
+      function qrMenuJson() {
+        const skip = new Set(["menuler"]),
+          kurus = tl => Math.round(tl * 100);
+        const optionsOf = p => {
+          const g = modsFor(p).map(m => ({
+            id: m.id,
+            name: m.n,
+            multi: !!m.multi,
+            required: !m.multi,
+            choices: m.opts.map((o, i) => ({ id: `${m.id}-${i}`, name: o.n, price: kurus(o.p || 0) })),
+          }));
+          const ex = extrasFor(p);
+          if (ex.length) g.push({ id: "ekstra", name: "Ekstra", multi: true, required: false, choices: ex.map(e => ({ id: "ex-" + e.k, name: e.n, price: kurus(e.p) })) });
+          return g;
+        };
+        return {
+          restaurant: { name: S.rname || "Nazura", currency: "TRY" },
+          updated: new Date().toISOString(),
+          categories: CATS.filter(([id]) => !skip.has(id)).map(([id, name], i) => ({ id, name, sort: i + 1 })),
+          items: PRODUCTS.filter(p => !skip.has(p.cat) && !p.archived && !p.deleted).map((p, i) => {
+            const names = [...new Set((RECIPES[p.id] || []).map(([k]) => ING[k]).filter(g => g && !g.pack && g.c !== "İçecek").map(g => g.n))];
+            return {
+              id: p.id,
+              category_id: p.cat,
+              name: p.name,
+              description: p.desc || (names.length > 1 ? names.join(", ") : ""),
+              price: kurus(p.price),
+              image: p.img || null,
+              available: !p.stop,
+              sort: i + 1,
+              options: optionsOf(p),
+            };
+          }),
+        };
+      }
     </script>
 
     <!-- ============================== js/logic/stock.js ============================== -->
@@ -4837,10 +4878,11 @@
         if (st === "teslim") {
           o.status = "kapali";
           o.closedAt = now();
+          if (APPCH.includes(o.channel)) o.commRate = INTEG.comm?.[o.channel] ?? 0;
           const pm =
             o.collect ||
             (o.pay === "Online" ? "Online" : String(o.pay).toLocaleLowerCase("tr-TR").includes("kart") ? "Kart" : "Nakit");
-          o.paid = [{ m: pm, a: net(o) }];
+          o.paid = o.paidSplit ? o.paidSplit.map(p => ({ ...p })) : [{ m: pm, a: net(o) }];
           const c = o.custId && C(o.custId);
           if (c) visit(c, CH[o.channel].n, net(o), o);
           toast(c ? `Teslim edildi · ${c.name}: ${c.visits}. sipariş` : "Teslim edildi");
@@ -4872,6 +4914,9 @@
         o.waiters = o.waiters || [];
         if (n !== o.by && !o.waiters.includes(n)) o.waiters.push(n);
       }
+      // Platform komisyonu: kapanışta oran siparişe yazılır (oran sonra değişse bile eski siparişler doğru kalır)
+      const commRate = o => (APPCH.includes(o.channel) ? (o.commRate ?? INTEG.comm?.[o.channel] ?? 0) : 0);
+      const commOf = o => (net(o) * commRate(o)) / 100;
       // Online ödendi mi (QR sitesi veya platform) — adisyonda, kartlarda ve arşivde rozet
       const paidOnline = o => !!o.online || o.pay === "Online" || o.paid.some(p => /Online/.test(p.m));
       const isQr = o => !!o.qr || o.paid.some(p => /QR/.test(p.m));
@@ -5063,6 +5108,10 @@
         if (o && loyCounts(o) && total(o) >= LOY.min) {
           c.stamps = (loyStamps(c) + 1) % LOY.every;
           c.lastStamp = now();
+        } else if (o && loyCounts(o)) {
+          // en az tutarın altında (ör. sadece içecek): sadakatte sayılmaz, ayrıca sayılır
+          c.small = (c.small || 0) + 1;
+          c.hist[0].ns = true;
         }
         if (o)
           o.items
@@ -5159,9 +5208,10 @@
 
       const RL = () => ROLES[S.user?.role] || ROLES.garson;
 
+      // Rol yetkisi + kişiye özel ek yetki (Personel → düzenle → Ek yetkiler; ör. garson Ali personel yemeğini kaydedebilir)
       const can = p => {
         const r = RL();
-        return r.can === "all" || r.can.includes(p);
+        return r.can === "all" || r.can.includes(p) || !!SF(S.user?.id)?.perms?.includes(p);
       };
 
       const viewOK = v => {
@@ -5182,6 +5232,30 @@
       }
 
       const inNow = sid => SHIFTS.find(x => x.sid === sid && !x.out);
+
+      // ===== Personel yemeği =====
+      const SMK = { free: "Personel yemeği", maas: "Hak aşımı · maaştan", disc: "Personel indirimi", fam: "Aile / arkadaş indirimi" };
+      // Vardiya başlangıcı: içerideyse giriş saati, değilse bugünün başı
+      const shiftStart = sid => inNow(sid)?.in || parseISO(T0).getTime();
+      // Bu vardiyada kullanılan ücretsiz ürün hakkı
+      const smUsed = sid =>
+        S.orders
+          .filter(o => o.status !== "iptal" && o.createdAt >= shiftStart(sid))
+          .reduce((s, o) => s + o.items.filter(i => i.sm?.k === "free" && i.sm.sid === sid).reduce((t, i) => t + i.qty, 0), 0);
+      const smLeft = sid => Math.max(0, (SMEAL.free || 0) - smUsed(sid));
+      // Bir siparişin personel kayıtları (rapor ve arşiv için)
+      function smOf(o) {
+        if (!o.sm) return null;
+        const free = o.items.filter(i => i.sm?.k === "free"),
+          maas = o.items.filter(i => i.sm?.k === "maas");
+        return {
+          ...o.sm,
+          cost: free.reduce((s, i) => s + lineCost(i, o.channel !== "masa") * i.qty, 0),
+          menu: free.reduce((s, i) => s + (i.sm.orig || 0) * i.qty, 0),
+          maas: maas.reduce((s, i) => s + i.price * i.qty, 0),
+          disc: o.sm.k === "disc" || o.sm.k === "fam" ? Math.max(0, total(o) - net(o)) : 0,
+        };
+      }
 
       const hToday = sid =>
         SHIFTS.filter(x => x.sid === sid && iso(new Date(x.in)) === T0).reduce((s, x) => s + ((x.out || now()) - x.in), 0) /
@@ -5339,7 +5413,27 @@
             ]);
           }
         }
-        return { R, cl, ip, ciro, gider, byCh, byPay, byP, avgDel, staff, buy, fire, ikram, priceCh, series, pk };
+        // platform komisyonu
+        const byComm = {};
+        cl.forEach(o => {
+          const c = commOf(o);
+          if (c) byComm[o.channel] = (byComm[o.channel] || 0) + c;
+        });
+        const comm = Object.values(byComm).reduce((s, v) => s + v, 0);
+        // personel yemeği ve indirimleri (notlarıyla)
+        const sm = cl
+          .filter(o => o.sm)
+          .map(o => ({ o, ...smOf(o), where: o.table ? "Masa " + o.table : o.code || "#" + o.id }))
+          .sort((a, b) => b.o.closedAt - a.o.closedAt);
+        const smSum = {
+          cost: sm.reduce((s, x) => s + x.cost, 0),
+          maas: sm.reduce((s, x) => s + x.maas, 0),
+          disc: sm.filter(x => x.k === "disc").reduce((s, x) => s + x.disc, 0),
+          fam: sm.filter(x => x.k === "fam").reduce((s, x) => s + x.disc, 0),
+        };
+        // kapıda ödeme değişiklikleri
+        const payCh = cl.filter(o => o.payChange);
+        return { R, cl, ip, ciro, gider, byCh, byPay, byP, avgDel, staff, buy, fire, ikram, priceCh, series, pk, byComm, comm, sm, smSum, payCh };
       }
     </script>
 
@@ -5415,6 +5509,7 @@
           RESV,
           KASA,
           INTEG,
+          SMEAL,
           PRINTROUTE,
           KVKK,
           EXTRA,
@@ -5425,6 +5520,7 @@
           PLATFORMS,
           S: {
             rname: S.rname,
+            p14: S.p14,
             qrBase: S.qrBase,
             qrList: S.qrList,
             repPass: S.repPass,
@@ -5464,7 +5560,7 @@
             DEV,
             PLATFORMS,
           },
-          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES };
+          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, SMEAL };
         Object.entries(A).forEach(([k, a]) => {
           if (Array.isArray(d[k])) a.splice(0, a.length, ...d[k]);
         });
@@ -5476,8 +5572,11 @@
         });
         // eski kayıtlara yeni bölüm: kasiyer sipariş arşivini görsün
         if (Array.isArray(ROLES.kasiyer?.views) && !ROLES.kasiyer.views.includes("arsiv")) ROLES.kasiyer.views.push("arsiv");
+        // paket 14: kasiyer kurye ödemesini onaylayabilir
+        if (Array.isArray(ROLES.kasiyer?.can) && !d.S?.p14 && !ROLES.kasiyer.can.includes("payOk")) ROLES.kasiyer.can.push("payOk");
+        S.p14 = true;
         if (d.S) {
-          ["rname", "qrBase", "repPass", "autoAccept", "lastBackup"].forEach(k => {
+          ["rname", "qrBase", "repPass", "autoAccept", "lastBackup", "p14"].forEach(k => {
             if (d.S[k] != null && !(k === "qrBase" && /menu\.nazura\.com\.tr|claude\.ai\/artifact/.test(d.S[k]))) S[k] = d.S[k];
           });
           if (Array.isArray(d.S.qrList)) S.qrList = d.S.qrList;
@@ -6170,7 +6269,7 @@
         kasiyer: {
           n: "Kasiyer",
           views: ["home", "pos", "kitchen", "cust", "kasa", "arsiv"],
-          can: ["pay", "discount", "cancel", "kasa"],
+          can: ["pay", "discount", "cancel", "kasa", "payOk"],
         },
         garson: { n: "Garson", views: ["home", "pos", "kitchen"], can: ["pay"] },
         mutfak: { n: "Mutfak", views: ["kitchen"], can: [] },
@@ -6186,6 +6285,8 @@
         ["cancel", "Online siparişi iptal"],
         ["buy", "Alış fiyatı değiştirme"],
         ["kasa", "Kasa işlemleri"],
+        ["payOk", "Kurye ödemesini onaylamak"],
+        ["staffMeal", "Personel yemeği / indirimi (başkası için)"],
       ];
 
       const VIEWN = {
@@ -6217,6 +6318,8 @@
         { id: 9, n: "Kemal", role: "satin", pin: "5555", phone: "0546 888 99 00", wage: 180, wageType: "saatlik" },
       ].map(s => Object.assign({ active: true, adv: [], paid: {}, mh: 0 }, s));
 
+      // Personel yemeği ayarları: vardiya başına ücretsiz ürün hakkı, personel indirimi, aile/arkadaş indirimi (%)
+      const SMEAL = { free: 2, disc: 30, fam: 15 };
       const SHIFTS = []; // vardiya: {sid,in,out,fix?} — fix: elle düzeltildi
       const STAFFNOTES = []; // takvim notları
       let NID = 0;
@@ -6291,6 +6394,8 @@
         efat: { prov: "", vkn: "", title: "", auto: true, on: false },
         wa: { on: false },
         sync: true,
+        // Platform komisyonu (%) — platform sözleşmesindeki oran. Raporlarda ciro, komisyon ve restorana kalan ayrı görünür.
+        comm: { yemeksepeti: 0, getir: 0, trendyol: 0, migros: 0 },
       };
 
       const PRINTROUTE = { icecek: "bp" }; // kategori → yazıcı (yoksa mutfak)
@@ -6623,6 +6728,40 @@
           }
           o.paid = [{ m: ch === "masa" ? (r(2) ? "Kart" : "Nakit") : ch === "telefon" ? "Nakit" : "Online", a: total(o) }];
           S.orders.push(o);
+        }
+        // paket 14 örnekleri: kapıda ödeme değişikliği (onay bekliyor), personel yemeği, aile indirimi
+        {
+          const P1 = PRODUCTS.find(p => p.cat === "burger") || PRODUCTS[0],
+            D1 = PRODUCTS.find(p => p.cat === "icecek" && !p.combo) || PRODUCTS[1];
+          const t1 = mk({ channel: "telefon", status: "kapali", stage: "teslim", createdAt: min(70), items: [it(P1.id, 2, true, true, 0, "telefon")], by: "Zeynep" });
+          t1.closedAt = min(40);
+          t1.courier = "Emre";
+          t1.pay = "Kapıda kart";
+          t1.customer = { name: NAMES[2], address: STREETS[1] };
+          const tt = total(t1),
+            kk = Math.round(tt * 0.6);
+          t1.paid = [
+            { m: "Kart", a: kk },
+            { m: "Nakit", a: tt - kk },
+          ];
+          t1.collect = "Parçalı";
+          t1.payChange = { from: "Kart", to: `Kart ${fmt(kk)} + Nakit ${fmt(tt - kk)}`, by: "Emre", t: t1.closedAt, ok: "" };
+          S.orders.push(t1);
+          const t2 = mk({ channel: "masa", status: "kapali", stage: "servis", createdAt: min(150), items: [], by: "Ali", table: HALLS.Salon[3] });
+          t2.items = [
+            Object.assign(it(P1.id, 1, true, true, 0, "masa"), { price: 0, sm: { sid: 5, name: "Mehmet", k: "free", orig: P1.price } }),
+            Object.assign(it(D1.id, 1, true, true, 0, "masa"), { price: 0, sm: { sid: 5, name: "Mehmet", k: "free", orig: D1.price } }),
+          ];
+          t2.sm = { sid: 5, name: "Mehmet", k: "free", note: "Öğle yemeği", by: "Mehmet", t: min(150) };
+          t2.closedAt = min(130);
+          t2.paid = [];
+          S.orders.push(t2);
+          const t3 = mk({ channel: "masa", status: "kapali", stage: "servis", createdAt: min(100), items: [it(P1.id, 2, true, true, 0, "masa"), it(D1.id, 2, true, true, 0, "masa")], by: "Ayşe", table: HALLS.Salon[6] });
+          t3.discount = SMEAL.fam;
+          t3.sm = { sid: 3, name: "Ayşe", k: "fam", note: "Ayşe'nin annesi ve kardeşi", by: "Yönetici", t: min(100) };
+          t3.closedAt = min(60);
+          t3.paid = [{ m: "Kart", a: net(t3) }];
+          S.orders.push(t3);
         }
         LOG.push(
           { t: min(240), k: "kofte", d: +20, why: "Stok girişi" },
@@ -7257,6 +7396,29 @@
     <script>
       // Адисьон стола/телефонного заказа, оплата, окна опций, ikram, перенос.
 
+      // Personel yemeği / personel indirimi / aile-arkadaş indirimi
+      function smModal() {
+        const o = S.orders.find(x => x.id === S.activeId),
+          me = SF(S.user.id),
+          list = can("staffMeal") ? STAFF.filter(x => x.active) : [me].filter(Boolean),
+          sid = S.smSid || me?.id || list[0]?.id,
+          k = S.smK || "free",
+          left = smLeft(sid),
+          units = o.items.filter(i => !i.gift && !i.ikram && !i.sm).reduce((t, i) => t + i.qty, 0);
+        const opt = (v, t, d) => `<label class="opt"><input type="radio" name="sm-k" value="${v}" data-act="smK" ${k === v ? "checked" : ""}><span><b>${t}</b><br><small class="hint">${d}</small></span></label>`;
+        modal(`<h2>Personel</h2>
+       ${fld("sm-s", "Kim için", sel("sm-s", list.map(x => [x.id, x.n]), sid, 'data-act="smSid"'))}
+       <div class="field"><span class="lbl">Tür</span><div class="optl">
+        ${opt("free", "Personel yemeği (ücretsiz)", `Bu vardiyada hak: ${SMEAL.free} ürün · kalan ${left}. Maliyeti personel gideri olarak yazılır.`)}
+        ${opt("disc", `Personel indirimi %${SMEAL.disc}`, "Personel kendisi için alıyor; indirim tutarı gider olarak raporda görünür.")}
+        ${opt("fam", `Aile / arkadaş indirimi %${SMEAL.fam}`, "Not zorunlu: kimin ailesi veya arkadaşı. Raporda notuyla görünür.")}
+       </div></div>
+       ${k === "free" && units > left ? `<p class="notice warn" style="margin:0">${IC.alert || ""} Adisyonda ${units} ürün var, kalan hak ${left}. Fazla ${units - left} ürün %${SMEAL.disc} indirimle <b>maaştan düşülür</b>; not yazmak zorunlu.</p>` : ""}
+       ${fld("sm-n", k === "fam" || (k === "free" && units > left) ? "Not (zorunlu)" : "Not", `<input id="sm-n" placeholder="${k === "fam" ? "Örn. Ali'nin annesi ve kardeşi" : "Örn. öğle yemeği"}">`)}
+       <div class="err" id="sm-err"></div>
+       <button class="btn pri" data-act="smDo">Uygula</button><button class="btn ghost" data-act="close">Vazgeç</button>`);
+      }
+
       // Masanın garsonu: yönetici değiştirebilir; başka garson açtıysa uyarı
       function waiterBar(o) {
         const me = S.user,
@@ -7303,7 +7465,7 @@
                 (
                   i,
                   ix,
-                ) => `<div class="line ${i.sent ? "" : "new"} ${i.gift || i.ikram ? "giftline" : ""}"><div class="ln">${esc(iName(i))}${i.gift ? ' <span class="giftchip">Hediye</span>' : ""}${i.ikram ? ' <span class="giftchip">İkram</span>' : ""}${i.mods && i.mods.length ? `<small class="mods">${esc(iMods(i))}</small>` : ""}${i.note ? `<small class="mods">Not: ${esc(i.note)}</small>` : ""}${byOther(i) ? `<small class="addby">Ekleyen: ${esc(i.by)} (başka garson)</small>` : i.by === "Misafir (QR)" ? `<small class="addby qr">QR · misafir sipariş etti</small>` : ""}<small>${i.sent ? (i.ready ? "Hazır" : "Mutfakta · " + ago(i.sentAt)) : "Yeni · gönderilmedi"}</small></div>
+                ) => `<div class="line ${i.sent ? "" : "new"} ${i.gift || i.ikram ? "giftline" : ""}"><div class="ln">${esc(iName(i))}${i.gift ? ' <span class="giftchip">Hediye</span>' : ""}${i.ikram ? ' <span class="giftchip">İkram</span>' : ""}${i.mods && i.mods.length ? `<small class="mods">${esc(iMods(i))}</small>` : ""}${i.note ? `<small class="mods">Not: ${esc(i.note)}</small>` : ""}${i.sm ? `<small class="addby sm">${SMK[i.sm.k]} · ${esc(i.sm.name)}</small>` : ""}${byOther(i) ? `<small class="addby">Ekleyen: ${esc(i.by)} (başka garson)</small>` : i.by === "Misafir (QR)" ? `<small class="addby qr">QR · misafir sipariş etti</small>` : ""}<small>${i.sent ? (i.ready ? "Hazır" : "Mutfakta · " + ago(i.sentAt)) : "Yeni · gönderilmedi"}</small></div>
          <div class="qty"><button data-act="qty" data-i="${ix}" data-d="-1" aria-label="Azalt">−</button><span class="num">${i.qty}</span><button data-act="qty" data-i="${ix}" data-d="1" aria-label="Arttır" ${i.ikram ? "disabled" : ""}>+</button></div>
          <div class="lnr"><span class="num">${fmt(i.price * i.qty)}</span>${i.sent ? `<button class="lact" data-act="lineAct" data-i="${ix}" title="İkram veya iptal" aria-label="İkram veya iptal">⋯</button>` : `<button class="lact" data-act="lineNote" data-i="${ix}" title="Not ekle" aria-label="Not ekle">✎</button>`}</div></div>`,
               )
@@ -7343,7 +7505,7 @@
               : `<button class="btn ghost" style="width:100%" data-act="custModal">${IC.cust} Müşteri bağla</button>`);
           acts = `<button class="btn pri wide" data-act="send" ${unsent ? "" : "disabled"}>Mutfağa gönder</button>
          <button class="btn" data-act="move">Masa taşı</button><button class="btn" data-act="mergeModal">Masa birleştir</button>
-         <button class="btn" data-act="itemMoveModal" ${o.items.length ? "" : "disabled"}>Ürün taşı</button><button class="btn pri" data-act="pay" ${o.items.length ? "" : "disabled"} style="background:var(--fg);color:var(--bg)">Ödeme al</button>`;
+         <button class="btn" data-act="itemMoveModal" ${o.items.length ? "" : "disabled"}>Ürün taşı</button><button class="btn" data-act="smModal" ${o.items.length && !o.sm ? "" : "disabled"} title="Personel yemeği, personel veya aile indirimi">${IC.staff} Personel</button><button class="btn pri" data-act="pay" ${o.items.length ? "" : "disabled"} style="background:var(--fg);color:var(--bg)">Ödeme al</button>`;
         } else {
           const c = o.custId && C(o.custId),
             cu = o.customer;
@@ -7364,7 +7526,7 @@
         return `<div class="pos"><div style="min-width:0"><div class="row" style="margin-bottom:12px"><button class="btn ghost" data-act="back">← Ana Sayfa</button></div>
         <div class="cats">${cats}</div><div class="prods">${prods || `<div class="empty" style="grid-column:1/-1">Bu kategoride ürün yok. Ürünleri Ayarlar → Kurulum'dan ekleyin.</div>`}</div></div>
         <aside class="ticket"><div class="th">${head}</div>${gb}${cb}<div class="lines">${lines}</div>
-        <div class="tfoot">${ca ? `<div class="split hint"><span>Kampanya</span><span class="num">−${fmt(ca)}</span></div>` : ""}${o.discount ? `<div class="split hint"><span>İndirim %${o.discount}</span><span class="num">−${fmt(((total(o) - ca) * o.discount) / 100)}</span></div>` : ""}${o.override != null ? `<div class="split hint"><span>Fiyat elle değiştirildi</span><span class="num">${fmt(o.override)}</span></div>` : ""}
+        <div class="tfoot">${ca ? `<div class="split hint"><span>Kampanya</span><span class="num">−${fmt(ca)}</span></div>` : ""}${o.sm && (o.sm.k === "disc" || o.sm.k === "fam") ? `<div class="split hint"><span>${SMK[o.sm.k]} · ${esc(o.sm.name)}${o.sm.note ? " · " + esc(o.sm.note) : ""}</span></div>` : ""}${o.discount ? `<div class="split hint"><span>İndirim %${o.discount}</span><span class="num">−${fmt(((total(o) - ca) * o.discount) / 100)}</span></div>` : ""}${o.override != null ? `<div class="split hint"><span>Fiyat elle değiştirildi</span><span class="num">${fmt(o.override)}</span></div>` : ""}
         <div class="total"><span class="lbl">Toplam</span><b>${fmt(net(o))}</b></div>${extra}<div class="acts">${acts}</div></div></aside></div>`;
       }
 
@@ -7823,8 +7985,9 @@
         <p class="hint" style="margin:0">${LOY.type === "disc" ? `Her <b>${LOY.every}.</b> siparişte hesaba <b>%${LOY.pct} indirim</b>.` : `Her <b>${LOY.every}.</b> siparişte <b>${esc(P(LOY.gift)?.name || "—")}</b> hediye. Hediye maliyeti ${fmt(costOf(LOY.gift) || 0)}, menü fiyatı ${fmt(P(LOY.gift)?.price || 0)}.`}</p>
         <div class="gform"><div class="field"><label class="lbl" for="loy-every">Kaçıncı siparişte</label><input id="loy-every" class="num" type="number" min="2" max="20" value="${LOY.every}" data-act="loySet" data-k="every"></div>
          <div class="field wide2" ${LOY.type === "disc" ? "hidden" : ""}><label class="lbl" for="loy-gift">Hediye ürün</label><select id="loy-gift" class="sel" data-act="loySet" data-k="gift">${opts}</select></div>
-         <div class="field"><label class="lbl" for="loy-min">En az sipariş (₺)</label><input id="loy-min" class="num" type="number" min="0" value="${LOY.min}" data-act="loySet" data-k="min"></div>
+         <div class="field"><label class="lbl" for="loy-min">Sayılması için en az tutar (₺)</label><input id="loy-min" class="num" type="number" min="0" value="${LOY.min}" data-act="loySet" data-k="min"></div>
          <div class="field"><label class="lbl" for="loy-days">Siparişler geçerli (gün)</label><input id="loy-days" class="num" type="number" min="7" value="${LOY.days}" data-act="loySet" data-k="days"></div></div>
+        <p class="hint" style="margin:0">Bu tutarın altındaki siparişler (ör. sadece bir içecek) sadakatte ve “Sipariş” sayısında sayılmaz; tabloda ayrıca “küçük sipariş” olarak görünür.</p>
         <label class="check"><input type="checkbox" id="loy-apps" data-act="loySet" data-k="apps" ${LOY.apps ? "checked" : ""}> Yemeksepeti, Getir, Trendyol, Migros siparişleri de sayılsın</label></section>
        <div class="row" style="margin-bottom:14px"><input class="search" id="custsearch" data-act="cq" placeholder="Ad, telefon veya adres ile ara" value="${esc(S.cq)}" aria-label="Müşteri ara"><button class="btn" data-act="bulkModal" style="margin-left:auto">${IC.msg || ""}Toplu mesaj</button><button class="btn pri" data-act="newCustOnly">${IC.plus} Yeni müşteri</button></div>
        <p class="hint" style="margin:0 0 12px">Yemeksepeti, Getir ve Trendyol müşterinin telefonunu göstermez. Bu siparişler müşteriye adres ile eşleştirilir: ana sayfadaki sipariş kartında “Bağla” veya “Müşteri olarak kaydet”.</p>
@@ -7842,7 +8005,7 @@
               .map(
                 c => `<tr class="${(S.csel || []).includes(c.id) ? "selrow" : ""}">
        <td><input type="checkbox" data-act="csel" data-id="${c.id}" aria-label="${esc(c.name)} seç" ${(S.csel || []).includes(c.id) ? "checked" : ""}></td><td><b>${esc(c.name)}</b>${c.note ? `<br><span class="hint">${esc(c.note)}</span>` : ""}</td><td class="num">${esc(c.phone) || '<span class="hint">—</span>'}</td>
-       <td class="hint" style="max-width:260px">${c.addresses.length ? c.addresses.map(esc).join("<br>") : "—"}</td><td class="r big">${c.visits}</td><td>${loyDots(c)}</td><td class="r num">${fmt(c.spent)}</td>
+       <td class="hint" style="max-width:260px">${c.addresses.length ? c.addresses.map(esc).join("<br>") : "—"}</td><td class="r big">${c.visits - (c.small || 0)}${c.small ? `<br><small class="hint" style="font-weight:400" title="En az sipariş tutarının altında kaldığı için sadakatte sayılmadı">+${c.small} küçük</small>` : ""}</td><td>${loyDots(c)}</td><td class="r num">${fmt(c.spent)}</td>
        <td class="hint">${ago(c.last)}<br>${esc(c.hist[0]?.w)}</td><td class="hint">${esc(payMix(c))}</td><td>${consentChip(c)}</td><td><button class="btn" data-act="editCust" data-id="${c.id}">Düzenle</button></td></tr>`,
               )
               .join("")}</tbody></table>`
@@ -8063,11 +8226,33 @@
        <div class="bmprev"><span class="lbl">Önizleme</span><p id="bm-prev"></p><b id="bm-n" class="num"></b><small class="hint" id="bm-x"></small></div>
        <p class="hint" style="margin:0">İndirim ve kampanya mesajı sadece kampanya izni verenlere gider (İYS). “Bilgilendirme” yalnızca sipariş, çalışma saati gibi reklam olmayan duyurular içindir. Gerçek gönderim için SMS veya WhatsApp sağlayıcısı bağlanmalı; demoda gönderim kayda geçer.</p>
        <div class="row"><button class="btn ghost" data-act="bmSaveTpl">Bu metni şablon olarak kaydet</button></div>
-       <button class="btn pri" data-act="bmSend">Gönder</button><button class="btn ghost" data-act="close">Vazgeç</button>`,
+       <button class="btn pri" data-act="bmSend">Gönder</button><button class="btn" data-act="bmWa">${IC.msg || ""}WhatsApp'ta tek tek aç</button><button class="btn ghost" data-act="close">Vazgeç</button>`,
           true,
         );
         S.bmTpl = tp?.id;
         bmPrev();
+      }
+
+      // WhatsApp'ta tek tek: her müşteri için WhatsApp kendi mesajıyla açılır, gönder tuşuna personel basar.
+      // Ücretsiz, onay gerekmez, numara kapanma riski yok (elle gönderim). Çok müşteride yavaş: o zaman WhatsApp Business API.
+      const waLink = (phone, text) => {
+        let d = digits(phone).replace(/^0/, "");
+        if (d.length === 10) d = "90" + d;
+        return `https://wa.me/${d}?text=${encodeURIComponent(text)}`;
+      };
+      function waListModal(t, rs, keep) {
+        S.waKeep = keep;
+        modal(
+          `<h2>WhatsApp'ta tek tek gönder</h2><p class="hint" style="margin:0">Her satırdaki düğme WhatsApp'ı o müşterinin kendi mesajıyla açar; WhatsApp'ta “Gönder”e basın, sonra buraya dönüp sıradakine geçin. Gönderilenler ✓ ile işaretlenir.</p>
+       <div class="wrapx"><table class="mtable sm"><thead><tr><th>Müşteri</th><th>Telefon</th><th></th></tr></thead><tbody>${rs
+         .map(
+           c =>
+             `<tr id="wa-${c.id}"><td><b>${esc(c.name)}</b></td><td class="num">${esc(c.phone)}</td><td><a class="btn pri" href="${waLink(c.phone, fillTpl(t, c))}" target="_blank" rel="noopener" data-act="waSent" data-id="${c.id}">WhatsApp'ta aç</a></td></tr>`,
+         )
+         .join("")}</tbody></table></div>
+       <button class="btn pri" data-act="waDone" data-n="${rs.length}">Bitti, kaydet</button><button class="btn ghost" data-act="waBack">← Mesaja dön</button>`,
+          true,
+        );
       }
 
       // Şablon oluştur / düzenle / sil
@@ -8517,7 +8702,39 @@
                 )
                 .join("")}</tbody></table></div>`
             : '<div class="hint">Henüz hareket yok.</div>'
-        }</section></div>${kasaHist()}`;
+        }</section></div>${kuryePanel()}${kasaHist()}`;
+      }
+
+      // Kurye ödemeleri: kapıda ödeme şekli değişenler onaya gelir; kuryenin topladığı nakit kasaya teslim alınır.
+      function kuryePanel() {
+        const today = closedToday().filter(o => o.courier),
+          pend = today.filter(o => o.payChange && !o.payChange.ok),
+          couriers = [...new Set(today.map(o => o.courier))];
+        if (!today.length) return "";
+        const cash = n =>
+          today.filter(o => o.courier === n).reduce((s, o) => s + o.paid.filter(p => p.m === "Nakit").reduce((t, p) => t + p.a, 0), 0);
+        const left = n =>
+          today
+            .filter(o => o.courier === n && !o.cashOk)
+            .reduce((s, o) => s + o.paid.filter(p => p.m === "Nakit").reduce((t, p) => t + p.a, 0), 0);
+        return `<section class="panel" style="margin-top:14px"><div class="split"><h3>Kurye ödemeleri</h3>${pend.length ? `<span class="chip warn">${pend.length} onay bekliyor</span>` : '<span class="chip ok">Hepsi onaylı</span>'}</div>
+        <p class="hint" style="margin:0">Kapıda ödeme şekli değişen siparişler (ör. kart yerine kart + nakit) burada onaylanır. Kuryenin topladığı nakit kasaya verilince “Teslim alındı”ya basın. Onaylayan kişi İşlem geçmişine yazılır.</p>
+        ${
+          pend.length
+            ? `<div class="wrapx"><table class="mtable sm"><thead><tr><th>Saat</th><th>Sipariş</th><th>Kurye</th><th>Planlanan</th><th>Alınan</th><th class="r">Tutar</th><th></th></tr></thead><tbody>${pend
+                .map(
+                  o =>
+                    `<tr><td class="num">${tStr(o.closedAt)}</td><td>${esc(oTitle(o))}<br><small class="hint">${o.code || "#" + o.id}</small></td><td>${esc(o.courier)}</td><td>${esc(o.payChange.from)}</td><td><b>${esc(o.payChange.to)}</b></td><td class="r num">${fmt(net(o))}</td><td><button class="btn pri" data-act="payOk" data-id="${o.id}">Onayla</button></td></tr>`,
+                )
+                .join("")}</tbody></table></div>`
+            : ""
+        }
+        <div class="wrapx"><table class="mtable sm"><thead><tr><th>Kurye</th><th class="r">Teslimat</th><th class="r">Topladığı nakit</th><th class="r">Kasaya verilecek</th><th></th></tr></thead><tbody>${couriers
+          .map(
+            n =>
+              `<tr><td><b>${esc(n)}</b></td><td class="r num">${today.filter(o => o.courier === n).length}</td><td class="r num">${fmt(cash(n))}</td><td class="r num">${left(n) ? `<b>${fmt(left(n))}</b>` : '<span class="chip ok">Teslim alındı</span>'}</td><td>${left(n) ? `<button class="btn" data-act="cashIn" data-n="${esc(n)}">Teslim alındı</button>` : ""}</td></tr>`,
+          )
+          .join("")}</tbody></table></div></section>`;
       }
 
       function kasaMoveModal(t) {
@@ -8545,6 +8762,32 @@
     <script>
       // Personel: список, смены и зарплата, курьеры, история действий.
 
+      // Personel yemeği: ayarlar + bu ayın kayıtları (notlarıyla). Kayıt adisyondaki “Personel” düğmesiyle yapılır.
+      function smTab() {
+        const mk = monthKey(T0),
+          rows = S.orders
+            .filter(o => o.sm && o.status !== "iptal" && monthKey(iso(new Date(o.createdAt))) === mk)
+            .map(o => ({ o, ...smOf(o), where: o.table ? "Masa " + o.table : o.code || "#" + o.id }))
+            .sort((a, b) => b.o.createdAt - a.o.createdAt);
+        const who = STAFF.filter(x => x.active && (ROLES[x.role].can === "all" || ROLES[x.role].can.includes("staffMeal") || x.perms?.includes("staffMeal"))).map(x => x.n);
+        return `<section class="panel"><h3>Ayarlar</h3><p class="hint" style="margin:0">Kayıt adisyondaki <b>Personel</b> düğmesiyle yapılır. Her çalışan kendi yemeğini kaydedebilir; başkası için kaydetmek yetki ister. Yetkili: <b>${esc(who.join(", ") || "—")}</b> (Personel → düzenle → Ek yetkiler veya Rol yetkileri).</p>
+        <div class="gform">
+         <div class="field"><label class="lbl" for="smf">Vardiya başına ücretsiz ürün</label><input id="smf" class="num" type="number" min="0" max="10" value="${SMEAL.free}" data-act="smSet" data-k="free"></div>
+         <div class="field"><label class="lbl" for="smd">Personel indirimi (%)</label><input id="smd" class="num" type="number" min="0" max="100" value="${SMEAL.disc}" data-act="smSet" data-k="disc"></div>
+         <div class="field"><label class="lbl" for="smm">Aile / arkadaş indirimi (%)</label><input id="smm" class="num" type="number" min="0" max="100" value="${SMEAL.fam}" data-act="smSet" data-k="fam"></div></div>
+        <p class="hint" style="margin:0">Hakkı aşan ürünler personel indirimiyle hesaplanır ve <b>maaştan düşülür</b> (not zorunlu); Vardiya ve maaş tablosunda avans/kesinti olarak görünür. Personel yemeğinin maliyeti raporda personel gideri olarak yazılır. Aile / arkadaş indiriminde not zorunludur.</p></section>
+        <section class="panel" style="margin-top:14px"><h3>Bu ay</h3>${
+          rows.length
+            ? `<div class="wrapx"><table class="mtable sm"><thead><tr><th>Zaman</th><th>Personel</th><th>Tür</th><th>Sipariş</th><th class="r">Maliyet / indirim</th><th class="r">Maaştan</th><th>Not</th><th>Kaydeden</th></tr></thead><tbody>${rows
+                .map(
+                  x =>
+                    `<tr><td class="num">${dtStr(x.o.createdAt)}</td><td><b>${esc(x.name)}</b></td><td><span class="chip">${SMK[x.k]}</span></td><td>${esc(x.where)}</td><td class="r num">${x.k === "free" ? fmt(x.cost) : "−" + fmt(x.disc)}</td><td class="r num">${x.maas ? fmt(x.maas) : "—"}</td><td>${x.note ? esc(x.note) : '<span class="hint">—</span>'}</td><td class="hint">${esc(x.by)}</td></tr>`,
+                )
+                .join("")}</tbody></table></div>`
+            : '<div class="hint">Bu ay kayıt yok.</div>'
+        }</section>`;
+      }
+
       function vStaff() {
         const t = S.staffTab || "list";
         const tabs = [
@@ -8552,6 +8795,7 @@
           ["vardiya", "Vardiya ve maaş"],
           ["takvim", "Takvim"],
           ["kurye", "Kuryeler"],
+          ["yemek", "Personel yemeği"],
           ["log", "İşlem geçmişi"],
         ]
           .map(([k, n]) => `<button class="tab ${t === k ? "on" : ""}" data-act="staffTab" data-s="${k}">${n}</button>`)
@@ -8596,6 +8840,7 @@
           })
           .join("")}</tbody></table></div>`;
         } else if (t === "takvim") b = staffCal();
+        else if (t === "yemek") b = smTab();
         else if (t === "kurye") {
           const cl = closedToday().filter(o => o.courier);
           b = `<p class="hint" style="margin:0 0 12px">Kurye ücreti paket başı hesaplanır. Ücreti tablodan değiştirebilirsiniz. Ödeme giderlere “Kurye” olarak yazılır.</p>
@@ -8654,6 +8899,7 @@
          ),
        )}${fld("sf-w", "Maaş (₺) · aylık tutar, gün ücreti veya saat ücreti", `<input id="sf-w" class="num" type="number" min="0" value="${s?.wage || 0}">`)}</div>
        <div id="sf-fw" ${(s?.role || "garson") === "kurye" ? "" : "hidden"}>${fld("sf-f", "Kurye: paket başı ücret (₺)", `<input id="sf-f" class="num" type="number" min="0" value="${s?.fee || 0}">`)}</div>
+       <div class="field"><span class="lbl">Ek yetkiler <span class="hint">(rolüne ek, sadece bu kişi)</span></span><div class="optl">${PERMS.map(([k, l]) => `<label class="opt"><input type="checkbox" class="sf-pm" value="${k}" ${s?.perms?.includes(k) ? "checked" : ""}><span>${l}</span></label>`).join("")}</div></div>
        ${fld("sf-note", "Not", `<textarea id="sf-note" rows="2" placeholder="Örn. ayın 9'unda çalışmayacak">${esc(s?.note || "")}</textarea>`)}
        <div class="err" id="sf-err"></div><button class="btn pri" data-act="staffSave" data-id="${s ? s.id : ""}">Kaydet</button>${s && s.id !== S.user?.id ? `<button class="btn danger" data-act="staffDelAsk" data-id="${s.id}">Personeli sil</button>` : ""}<button class="btn ghost" data-act="close">Vazgeç</button>`);
         setTimeout(() => $("#sf-n")?.focus(), 30);
@@ -8967,7 +9213,10 @@
           byCh,
           k => CH[k].c,
           k => CH[k].n,
-        )}</section>
+        )}${(() => {
+          const cm = closed.reduce((s, o) => s + commOf(o), 0);
+          return cm ? `<div class="split hint" style="margin-top:8px"><span>Platform komisyonu</span><b class="num">−${fmt(cm)}</b></div>` : "";
+        })()}</section>
         <section class="panel"><h3>Ödeme tipine göre</h3>${bars(
           byPay,
           () => "var(--accent)",
@@ -9215,7 +9464,14 @@
         <div class="field wide2"><label class="lbl" for="qrx">Bağlantı veya metin</label><input id="qrx" placeholder="https://instagram.com/nazura"></div></div>
         <div class="row"><button class="btn pri" data-act="qrMake">QR oluştur</button></div>
         ${S.qrList.length ? `<div class="qrgrid">${S.qrList.map(q => card(q.id, q.t, q.x)).join("")}</div>` : ""}</section>`;
-        return body;
+        return body + qrSyncPanel();
+      }
+
+      // QR menü fiyat güncelleme (sunucu kurulana kadar yarı otomatik)
+      function qrSyncPanel() {
+        return `<section class="panel" style="margin-top:14px"><div class="split"><h3>QR menüyü güncelle</h3>${S.qrSyncAt ? `<span class="hint">Son: ${dtStr(S.qrSyncAt)}</span>` : ""}</div>
+        <p class="hint" style="margin:0">Fiyat değiştirdiyseniz, ürün eklediyseniz veya bir ürünü satışa kapattıysanız QR menünün de bilmesi gerekir. Şimdilik: düğmeye basın, inen <b>menu.json</b> dosyasını GitHub'daki <b>nazura-qr</b> deposuna yükleyin (Add file → Upload files → Commit). 1–2 dakika içinde QR menüde yeni fiyatlar görünür. Sunucu kurulunca bu adım kalkar, her değişiklik QR menüye anında gider.</p>
+        <div class="row"><button class="btn pri" data-act="qrSync">${IC.dl || ""}QR menüyü güncelle (menu.json indir)</button></div></section>`;
       }
 
       // Ayarlar: önce “Genel bakış” (neyin hazır olduğu), sonra kurulum sırasına göre gruplar
@@ -9256,7 +9512,9 @@
           I = INTEG;
         const ap = (k, n, h) =>
           `<div class="dev"><div class="split"><h3>${n}</h3>${st(I[k].on, "Başvuru gerekli")}</div><div class="hint">${h}</div>${testLine(k)}<div class="row"><button class="btn ghost" data-act="intToggle" data-k="${k}">${I[k].on ? "Bağlantıyı kes (demo)" : "Bağlandı olarak işaretle (demo)"}</button></div></div>`;
-        return `<p class="hint" style="margin:0 0 14px">Her kartta “Test et” bağlantıyı dener ve sonucu yazar: bağlı mı, değilse ne yapmalı. ÖKC ve e-Arşiv “Kasa ve ÖKC” sekmesinde. Demo: bağlantılar taklit edilir. Canlı sistemde her platformun resmi API erişimi gerekir; erişim gelince siparişler ana sayfaya otomatik düşer, fiyat ve “ürün kapandı” bilgisi platformlara otomatik gider.</p>
+        return `<section class="panel" style="margin-bottom:14px"><h3>Platform komisyonları</h3><p class="hint" style="margin:0">Yemek uygulamaları her siparişten komisyon alır. Sözleşmenizdeki oranı yazın; raporlarda ciro, komisyon ve restorana kalan tutar ayrı görünür. Oran değişirse eski siparişler kendi oranıyla kalır.</p>
+        <div class="gform">${APPCH.map(k => `<div class="field"><label class="lbl" for="cm-${k}">${CH[k].n} (%)</label><input id="cm-${k}" class="num" type="number" min="0" max="60" step="0.5" value="${I.comm?.[k] ?? 0}" data-act="commSet" data-k="${k}"></div>`).join("")}</div></section>
+        <p class="hint" style="margin:0 0 14px">Her kartta “Test et” bağlantıyı dener ve sonucu yazar: bağlı mı, değilse ne yapmalı. ÖKC ve e-Arşiv “Kasa ve ÖKC” sekmesinde. Demo: bağlantılar taklit edilir. Canlı sistemde her platformun resmi API erişimi gerekir; erişim gelince siparişler ana sayfaya otomatik düşer, fiyat ve “ürün kapandı” bilgisi platformlara otomatik gider.</p>
        <div class="devs"><div class="dev"><div class="split"><h3>Trendyol Yemek</h3>${st(I.trendyol.on)}</div><div class="hint">Partner paneli → Hesap Bilgilerim → Entegrasyon Bilgileri'ndeki bilgileri girin.</div>
         ${fld("it-sid", "Satıcı ID", inp("it-sid", I.trendyol.sid, 'class="num"'))}${fld("it-key", "API Key", inp("it-key", I.trendyol.key))}${fld("it-sec", "API Secret", `<input id="it-sec" type="password" value="${esc(I.trendyol.sec)}">`)}<button class="btn pri" data-act="intTy">Kaydet ve test et</button>${testLine("trendyol")}</div>
         ${ap("yemeksepeti", "Yemeksepeti", "Entegrasyon için Yemeksepeti iş ortağı (entegratör) programına başvuru yapılır. Onaydan sonra anahtar buraya girilir.")}
@@ -9653,6 +9911,15 @@
         ["Havale", "Havale / EFT"],
       ];
       const collectOf = o => o.collect || o.paid?.[0]?.m || "";
+      // Planlanan ödeme (platformda/telefonda söylenen)
+      const planPay = o => (o.pay === "Online" ? "Online" : String(o.pay || "").toLocaleLowerCase("tr-TR").includes("kart") ? "Kart" : "Nakit");
+      // Kapıda ödeme değiştiyse: onay durumu rozeti
+      const payChip = o =>
+        o.payChange
+          ? o.payChange.ok
+            ? `<span class="chip ok" title="${esc(o.payChange.from)} → ${esc(o.payChange.to)} · onaylayan ${esc(o.payChange.ok)}">Değişti · onaylandı</span>`
+            : `<span class="chip warn" title="${esc(o.payChange.from)} → ${esc(o.payChange.to)}">Değişti · onay bekliyor</span>`
+          : "";
 
       function kCard(o, mode) {
         const c = o.custId && C(o.custId),
@@ -9684,7 +9951,7 @@
           done = closedToday()
             .filter(o => o.courier === me)
             .sort((a, b) => b.closedAt - a.closedAt);
-        const sum = m => done.filter(o => collectOf(o) === m).reduce((s, o) => s + net(o), 0);
+        const sum = m => done.reduce((s, o) => s + o.paid.filter(p => p.m === m).reduce((t, p) => t + p.a, 0), 0);
         const fee = (STAFF.find(s => s.n === me)?.fee || 0) * done.length;
         const sec = (t, list, mode, empty) =>
           `<section class="panel"><div class="split"><h3>${t}</h3><span class="chip">${list.length}</span></div>${list.length ? `<div class="kgrid">${list.map(o => kCard(o, mode)).join("")}</div>` : `<div class="hint">${empty}</div>`}</section>`;
@@ -9697,7 +9964,7 @@
             ? `<div class="wrapx"><table class="mtable sm"><thead><tr><th>Saat</th><th>Müşteri</th><th>Adres</th><th>Ödeme</th><th class="r">Tutar</th></tr></thead><tbody>${done
                 .map(
                   o =>
-                    `<tr><td class="num">${tStr(o.closedAt)}</td><td>${esc(oTitle(o))}</td><td class="hint">${esc(o.customer?.address || "")}</td><td><span class="chip">${esc(collectOf(o))}</span></td><td class="r num">${fmt(net(o))}</td></tr>`,
+                    `<tr><td class="num">${tStr(o.closedAt)}</td><td>${esc(oTitle(o))}</td><td class="hint">${esc(o.customer?.address || "")}</td><td><span class="chip">${esc(o.paid.map(p => (o.paid.length > 1 ? `${p.m} ${fmt(p.a)}` : p.m)).join(" + ") || collectOf(o))}</span> ${payChip(o)}</td><td class="r num">${fmt(net(o))}</td></tr>`,
                 )
                 .join("")}</tbody></table></div>`
             : '<div class="hint">Bugün teslim edilen sipariş yok.</div>'
@@ -9706,12 +9973,15 @@
 
       function kDoneModal(o) {
         const online = o.pay === "Online",
-          def = online ? "Online" : String(o.pay).toLocaleLowerCase("tr-TR").includes("kart") ? "Kart" : "Nakit";
+          def = planPay(o);
         modal(`<h2>Teslim · ${esc(oTitle(o))}</h2><div class="split"><span class="lbl">Tutar</span><b class="num" style="font-size:22px">${fmt(net(o))}</b></div>
        ${
          online
            ? '<p class="hint" style="margin:0">Bu sipariş platformda online ödendi. Müşteriden para alınmaz.</p>'
-           : `<div class="field"><span class="lbl">Ödemeyi nasıl aldınız?</span><div class="optl">${COLLECT.map(([v, l]) => `<label class="opt"><input type="radio" name="kc" value="${v}" ${v === def ? "checked" : ""}><span>${l}</span></label>`).join("")}</div></div>`
+           : `<p class="hint" style="margin:0">Siparişte yazan ödeme: <b>${esc(def)}</b>. Müşteri başka şekilde öderse aşağıdan seçin; değişiklik yöneticinin onayına gider.</p>
+       <div class="field"><span class="lbl">Ödemeyi nasıl aldınız?</span><div class="optl">${COLLECT.map(([v, l]) => `<label class="opt"><input type="radio" name="kc" value="${v}" data-act="kcPick" ${v === def ? "checked" : ""}><span>${l}</span></label>`).join("")}<label class="opt"><input type="radio" name="kc" value="Parcali" data-act="kcPick"><span>Parçalı (kart + nakit)</span></label></div></div>
+       <div id="kc-split" class="tf2" hidden>${fld("kc-k", "Kartla (₺)", `<input id="kc-k" class="num" type="number" min="0" max="${Math.round(net(o))}" step="1" data-act="kcSplit" data-t="${Math.round(net(o) * 100) / 100}">`)}${fld("kc-n", "Nakit (₺)", `<input id="kc-n" class="num" type="number" readonly value="${Math.round(net(o) * 100) / 100}">`)}</div>
+       <div class="err" id="kc-err"></div>`
        }
        <button class="btn pri" data-act="kDoneDo" data-id="${o.id}">Teslim edildi</button><button class="btn ghost" data-act="close">Vazgeç</button>`);
       }
@@ -9759,7 +10029,15 @@
          <div class="eqside"><div><span class="lbl">Sipariş</span><b class="num">${st.cl.length}</b></div><div><span class="lbl">Ort. sepet</span><b class="num">${fmt(st.cl.length ? st.cl.reduce((s, o) => s + net(o), 0) / st.cl.length : 0)}</b></div></div></section>
         <div class="rgrid">
          <section class="panel full"><div class="split"><h3>Ciro</h3><span class="hint">${p === "gun" ? "saatlere göre" : p === "yil" ? "aylara göre" : "günlere göre"}</span></div>${chart}</section>
-         <section class="panel"><h3>Kanallara göre</h3>${bars(st.byCh, k => CH[k]?.n || k)}<div class="split hint" style="margin-top:8px"><span>İptal / red</span><b class="num">${st.ip.length}</b></div><div class="split hint"><span>Ort. teslimat süresi</span><b class="num">${st.avgDel ? st.avgDel + " dk" : "—"}</b></div></section>
+         <section class="panel"><h3>Kanallara göre</h3>${bars(st.byCh, k => CH[k]?.n || k)}${
+           st.comm
+             ? `<div class="paylist" style="margin-top:8px">${Object.entries(st.byComm)
+                 .map(([k, v]) => `<div class="split hint"><span>${CH[k].n} komisyonu</span><b class="num">−${fmt(v)}</b></div>`)
+                 .join("")}<div class="split"><span>Platform komisyonu toplam</span><b class="num">−${fmt(st.comm)}</b></div></div>`
+             : APPCH.some(k => st.byCh[k]) && !APPCH.some(k => INTEG.comm?.[k])
+               ? '<div class="hint" style="margin-top:8px">Platform komisyon oranı girilmemiş (Ayarlar → Entegrasyonlar).</div>'
+               : ""
+         }<div class="split hint" style="margin-top:8px"><span>İptal / red</span><b class="num">${st.ip.length}</b></div><div class="split hint"><span>Ort. teslimat süresi</span><b class="num">${st.avgDel ? st.avgDel + " dk" : "—"}</b></div></section>
          <section class="panel"><h3>Ödeme yöntemleri</h3>${bars(st.byPay, k => esc(k))}</section>
          <section class="panel"><h3>En çok satanlar</h3>${bars(
            top,
@@ -9769,11 +10047,27 @@
          <section class="panel"><h3>Stok ve menü</h3><div class="paylist">
           <div class="split"><span>Malzeme alımı</span><b class="num">${fmt(st.buy)}</b></div><div class="split"><span>Fire maliyeti</span><b class="num">${fmt(st.fire)}</b></div>
           <div class="split"><span>İkram maliyeti</span><b class="num">${fmt(st.ikram)}</b></div><div class="split"><span>Fiyat değişikliği</span><b class="num">${st.priceCh}</b></div></div></section>
+         ${smPanel(st)}
+         ${st.payCh.length ? `<section class="panel full"><h3>Kapıda ödeme değişiklikleri</h3><div class="wrapx"><table class="mtable sm"><thead><tr><th>Zaman</th><th>Sipariş</th><th>Kurye</th><th>Planlanan</th><th>Alınan</th><th>Onay</th></tr></thead><tbody>${st.payCh.map(o => `<tr><td class="num">${dtStr(o.closedAt)}</td><td>${esc(oTitle(o))}</td><td>${esc(o.payChange.by)}</td><td>${esc(o.payChange.from)}</td><td><b>${esc(o.payChange.to)}</b></td><td>${o.payChange.ok ? `<span class="chip ok">${esc(o.payChange.ok)}</span>` : '<span class="chip warn">Bekliyor</span>'}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
          <section class="panel full"><h3>Personel</h3>${staffRows ? `<div class="wrapx"><table class="mtable sm"><thead><tr><th>Çalışan</th><th class="r">Gün</th><th class="r">Çalıştı</th><th class="r">Aldığı sipariş</th><th class="r">Ciro</th><th class="r">Teslimat</th><th class="r">İkram</th></tr></thead><tbody>${staffRows}</tbody></table></div>` : '<div class="hint">Kayıt yok.</div>'}</section>
         </div>
         <section class="panel" style="margin-top:14px"><div class="split"><h3>Tüm hareketler</h3><span class="hint" id="tkcount"></span></div>
          <div class="row tkfil">${sel("tk-c", [["", "Tüm türler"], ...EVCATS.map(c => [c, c])], S.tkC || "", 'data-act="tkF"')}${sel("tk-u", [["", "Tüm kişiler"], ...[...new Set(ACTLOG.map(a => a.u))].sort((a, b) => a.localeCompare(b, "tr")).map(u => [u, u])], S.tkU || "", 'data-act="tkF"')}<input id="tk-q" class="search" placeholder="Ara (örn. Emre, köfte, M4)" value="${esc(S.tkQ || "")}" data-act="tkQ" aria-label="Hareketlerde ara"></div>
          <div id="tkfeed">${tkFeed()}</div></section>`;
+      }
+
+      // Personel yemeği ve indirimleri: maliyet personel gideri; aile indirimi notuyla
+      function smPanel(st) {
+        if (!st.sm.length) return "";
+        const S2 = st.smSum;
+        return `<section class="panel full"><div class="split"><h3>Personel yemeği ve indirimleri</h3><span class="hint">Personel yemeğinin maliyeti personel gideridir</span></div>
+        <div class="wzsum"><div><span class="lbl">Personel yemeği maliyeti</span><b class="num">${fmt(S2.cost)}</b></div><div><span class="lbl">Personel indirimi</span><b class="num">${fmt(S2.disc)}</b></div><div><span class="lbl">Aile / arkadaş indirimi</span><b class="num">${fmt(S2.fam)}</b></div><div><span class="lbl">Maaştan düşülecek</span><b class="num">${fmt(S2.maas)}</b></div></div>
+        <div class="wrapx"><table class="mtable sm"><thead><tr><th>Zaman</th><th>Personel</th><th>Tür</th><th>Sipariş</th><th class="r">Tutar</th><th>Not</th><th>Kaydeden</th></tr></thead><tbody>${st.sm
+          .map(
+            x =>
+              `<tr><td class="num">${dtStr(x.o.closedAt)}</td><td><b>${esc(x.name)}</b></td><td><span class="chip">${SMK[x.k]}</span></td><td>${esc(x.where)}</td><td class="r num">${x.k === "free" ? `maliyet ${fmt(x.cost)}${x.maas ? `<br><small class="hint">maaştan ${fmt(x.maas)}</small>` : ""}` : `−${fmt(x.disc)}`}</td><td>${x.note ? esc(x.note) : '<span class="hint">—</span>'}</td><td class="hint">${esc(x.by)}</td></tr>`,
+          )
+          .join("")}</tbody></table></div></section>`;
       }
 
       // Takvim: her günde ciro ve sipariş sayısı (renk koyuluğu = ciro). Güne dokununca o günün tüm istatistiği açılır.
@@ -9866,12 +10160,25 @@
           ["Malzeme alımı (₺)", Math.round(st.buy)],
           ["Fire (₺)", Math.round(st.fire)],
           ["İkram (₺)", Math.round(st.ikram)],
+          ["Platform komisyonu (₺)", Math.round(st.comm)],
+          ["Personel yemeği maliyeti (₺)", Math.round(st.smSum.cost)],
+          ["Personel indirimi (₺)", Math.round(st.smSum.disc)],
+          ["Aile / arkadaş indirimi (₺)", Math.round(st.smSum.fam)],
+          ["Maaştan düşülecek yemek (₺)", Math.round(st.smSum.maas)],
           [],
           ["Kanal", "Ciro (₺)"],
           ...Object.entries(st.byCh).map(([k, v]) => [CH[k]?.n || k, Math.round(v)]),
           [],
           ["Ödeme", "Tutar (₺)"],
           ...Object.entries(st.byPay).map(([k, v]) => [k, Math.round(v)]),
+        ]);
+        add("Personel yemeği", [
+          ["Zaman", "Personel", "Tür", "Sipariş", "Maliyet (₺)", "İndirim (₺)", "Maaştan (₺)", "Not", "Kaydeden"],
+          ...st.sm.map(x => [dt(x.o.closedAt), x.name, SMK[x.k], x.where, Math.round(x.cost), Math.round(x.disc), Math.round(x.maas), x.note || "", x.by]),
+        ]);
+        add("Kapıda ödeme", [
+          ["Zaman", "Sipariş", "Kurye", "Planlanan", "Alınan", "Onaylayan"],
+          ...st.payCh.map(o => [dt(o.closedAt), o.code || "#" + o.id, o.payChange.by, o.payChange.from, o.payChange.to, o.payChange.ok || "Bekliyor"]),
         ]);
         add("Hareketler", [
           ["Zaman", "Tür", "Kim", "İşlem", "Ayrıntı", "Onaylayan"],
@@ -9973,7 +10280,7 @@
                .slice(0, 2)
                .map(i => P(i.pid)?.name || i.name)
                .join(", "),
-           )}${o.items.length > 2 ? "…" : ""}</td><td class="r num">${fmt(net(o))}</td><td class="hint">${paidOnline(o) ? '<span class="chip ok">Online ödendi</span><br>' : ""}${[...new Set(o.paid.map(p => p.m))].join(", ") || o.pay || "—"}</td><td><span class="chip ${st[1]}">${st[0]}</span>${o.status === "iptal" && o.cancelBy ? `<br><small class="hint">İptal eden: ${esc(o.cancelBy)}</small>` : ""}${o.voids?.length ? `<br><small class="addby">${o.voids.reduce((t, v) => t + v.n, 0)} ürün iptal · ${esc([...new Set(o.voids.map(v => v.by))].join(", "))}</small>` : ""}</td>
+           )}${o.items.length > 2 ? "…" : ""}</td><td class="r num">${fmt(net(o))}</td><td class="hint">${paidOnline(o) ? '<span class="chip ok">Online ödendi</span><br>' : ""}${[...new Set(o.paid.map(p => p.m))].join(", ") || o.pay || "—"}</td><td><span class="chip ${st[1]}">${st[0]}</span>${o.status === "iptal" && o.cancelBy ? `<br><small class="hint">İptal eden: ${esc(o.cancelBy)}</small>` : ""}${o.sm ? `<br><small class="addby sm">${SMK[o.sm.k]}</small>` : ""}${o.payChange ? `<br><small class="${o.payChange.ok ? "hint" : "addby"}">Ödeme değişti${o.payChange.ok ? " · onaylı" : " · onay bekliyor"}</small>` : ""}${o.voids?.length ? `<br><small class="addby">${o.voids.reduce((t, v) => t + v.n, 0)} ürün iptal · ${esc([...new Set(o.voids.map(v => v.by))].join(", "))}</small>` : ""}</td>
            <td><button class="btn ghost" data-act="arDet" data-id="${o.id}">Detay</button></td></tr>`;
                 })
                 .join("")}</tbody></table></div>${rows.length > lim ? `<button class="btn" data-act="arMore" style="margin-top:10px">${rows.length - lim} sipariş daha göster</button>` : ""}`
@@ -9996,8 +10303,11 @@
          )
          .join("")}<div class="split"><b>Toplam</b><b class="num">${fmt(net(o))}</b></div></div>
        ${o.voids?.length ? `<div class="field"><span class="lbl">İptal edilen ürünler</span>${o.voids.map(v => `<div class="split"><span>${v.n}× ${esc(v.name)}${v.qr ? ' <span class="chip">QR</span>' : ""} <small class="hint">· ${esc(v.why)}</small></span><span><b>İptal eden: ${esc(v.by)}</b> <small class="hint num">${tStr(v.t)}</small></span></div>`).join("")}</div>` : ""}
+       ${commRate(o) ? `<div class="field"><span class="lbl">Platform komisyonu</span><div class="split"><span>%${commRate(o)} · ${CH[o.channel].n}</span><span class="num">−${fmt(commOf(o))}</span></div><div class="split"><b>Restorana kalan</b><b class="num">${fmt(net(o) - commOf(o))}</b></div></div>` : ""}
+       ${o.sm ? `<div class="field"><span class="lbl">Personel</span><div><span class="chip">${SMK[o.sm.k]}</span> <b>${esc(o.sm.name)}</b>${o.sm.note ? ` · Not: ${esc(o.sm.note)}` : ""} <small class="hint">· kaydeden ${esc(o.sm.by)}</small></div></div>` : ""}
+       ${o.payChange ? `<div class="field"><span class="lbl">Kapıda ödeme değişti</span><div>${esc(o.payChange.from)} → <b>${esc(o.payChange.to)}</b> · kurye ${esc(o.payChange.by)} · ${o.payChange.ok ? `onaylayan <b>${esc(o.payChange.ok)}</b>` : '<span class="chip warn">onay bekliyor</span>'}</div></div>` : ""}
        <div class="field"><span class="lbl">Ödeme${paidOnline(o) ? ' <span class="chip ok">Online ödendi</span>' : ""}</span>${o.paid.length ? o.paid.map(p => `<div class="split"><span>${esc(p.m)}</span><span class="num">${fmt(p.a)}</span></div>`).join("") : `<span class="hint">${esc(o.pay || "Kayıt yok")}</span>`}</div>
-       <div class="field"><span class="lbl">Kim</span><span>${[o.by ? "Masanın garsonu: " + esc(o.by) : "", o.waiters?.length ? "Diğer garsonlar: " + esc(o.waiters.join(", ")) : "", isQr(o) ? "QR sipariş" : "", o.courier ? "Kurye: " + esc(o.courier) : "", o.cancelBy ? "<b>İptal eden: " + esc(o.cancelBy) + "</b>" : "", o.cancelReason || o.cancelWhy ? "İptal nedeni: " + esc(o.cancelReason || o.cancelWhy) : ""].filter(Boolean).join(" · ") || '<span class="hint">—</span>'}</span></div>
+       <div class="field"><span class="lbl">Kim</span><span>${[o.by ? (o.channel === "masa" ? "Masanın garsonu: " : "Siparişi alan: ") + esc(o.by) : "", o.waiters?.length ? "Diğer garsonlar: " + esc(o.waiters.join(", ")) : "", isQr(o) ? "QR sipariş" : "", o.courier ? "Kurye: " + esc(o.courier) : "", o.cancelBy ? "<b>İptal eden: " + esc(o.cancelBy) + "</b>" : "", o.cancelReason || o.cancelWhy ? "İptal nedeni: " + esc(o.cancelReason || o.cancelWhy) : ""].filter(Boolean).join(" · ") || '<span class="hint">—</span>'}</span></div>
        <button class="btn ghost" data-act="close">Kapat</button>`,
           true,
         );
@@ -10013,7 +10323,7 @@
         XLSX.utils.book_append_sheet(
           wb,
           XLSX.utils.aoa_to_sheet([
-            ["Tarih", "Saat", "Sipariş", "Kanal", "Masa", "Müşteri", "Telefon", "Ürünler", "Tutar (₺)", "Ödeme", "Online ödendi", "Durum", "İptal eden", "İptal nedeni", "Masanın garsonu", "Başka garsonun eklediği", "İptal edilen ürünler (kim)", "Kurye"],
+            ["Tarih", "Saat", "Sipariş", "Kanal", "Masa", "Müşteri", "Telefon", "Ürünler", "Tutar (₺)", "Ödeme", "Online ödendi", "Durum", "İptal eden", "İptal nedeni", "Masanın garsonu", "Başka garsonun eklediği", "İptal edilen ürünler (kim)", "Platform komisyonu (₺)", "Restorana kalan (₺)", "Personel / indirim", "Kapıda ödeme değişikliği", "Kurye"],
             ...rows.map(o => {
               const c = o.custId ? C(o.custId) : o.customer;
               return [
@@ -10034,6 +10344,10 @@
                 o.by || "",
                 o.items.filter(byOther).map(i => `${i.qty}× ${P(i.pid)?.name || i.name} (${i.by})`).join(", "),
                 (o.voids || []).map(v => `${v.n}× ${v.name} · ${v.by} · ${v.why}`).join("; "),
+                Math.round(commOf(o)),
+                Math.round(net(o) - commOf(o)),
+                o.sm ? `${SMK[o.sm.k]} · ${o.sm.name}${o.sm.note ? " · " + o.sm.note : ""}` : "",
+                o.payChange ? `${o.payChange.from} → ${o.payChange.to} · ${o.payChange.ok ? "onay: " + o.payChange.ok : "onay bekliyor"}` : "",
                 o.courier || "",
               ];
             }),
@@ -10274,6 +10588,11 @@
           $("#tkfeed").innerHTML = tkFeed();
         }
         if (a === "pfCalc") pfCalc();
+        if (a === "kcSplit") {
+          const t = +b.dataset.t,
+            k = Math.max(0, Math.min(t, +b.value || 0));
+          $("#kc-n").value = Math.round((t - k) * 100) / 100;
+        }
         if (a === "pfIng") {
           const m = Object.keys(ING).find(
             k => ING[k].n.toLocaleLowerCase("tr-TR") === b.value.trim().toLocaleLowerCase("tr-TR"),
@@ -10485,6 +10804,39 @@
           ids.forEach(id => (b.checked ? set.add(id) : set.delete(id)));
           S.csel = [...set];
           $("#custtable").innerHTML = custTable(custRows(S.cq));
+        }
+        // Kurye teslim: parçalı ödeme seçilince kart/nakit kutuları açılır
+        if (a === "smSet") {
+          const k = b.dataset.k,
+            v = Math.max(0, Math.min(k === "free" ? 10 : 100, Math.round(+b.value || 0))),
+            old = SMEAL[k];
+          SMEAL[k] = v;
+          if (old !== v) act("Personel yemeği ayarı", `${{ free: "Ücretsiz ürün hakkı", disc: "Personel indirimi %", fam: "Aile indirimi %" }[k]}: ${old} → ${v}`, "", "Personel");
+          toast("Kaydedildi");
+          return;
+        }
+        if (a === "smK" || a === "smSid") {
+          if (a === "smK") S.smK = b.value;
+          else S.smSid = +b.value;
+          const n = $("#sm-n")?.value || "";
+          smModal();
+          if ($("#sm-n")) $("#sm-n").value = n;
+          return;
+        }
+        if (a === "kcPick") {
+          const sp = $("#kc-split");
+          if (sp) sp.hidden = b.value !== "Parcali";
+          if (b.value === "Parcali") setTimeout(() => $("#kc-k")?.focus(), 20);
+          return;
+        }
+        if (a === "commSet") {
+          const v = Math.max(0, Math.min(60, +b.value || 0));
+          INTEG.comm = INTEG.comm || {};
+          const old = INTEG.comm[b.dataset.k] ?? 0;
+          INTEG.comm[b.dataset.k] = v;
+          if (old !== v) act("Platform komisyonu", `${CH[b.dataset.k].n}: %${old} → %${v}`, "", "Ayarlar");
+          toast(`${CH[b.dataset.k].n} komisyonu %${v}`);
+          return;
         }
         // Yönetici masanın garsonunu değiştirir (adisyondan veya Ayarlar → İşletme ve masalar)
         if (a === "tableBy") {
@@ -11055,6 +11407,57 @@
             o.paid.push({ m: b.dataset.m, a: amt });
             payModal();
             return;
+          }
+          case "smModal":
+            S.smSid = null;
+            S.smK = "free";
+            smModal();
+            return;
+          case "smDo": {
+            if (o.sm) return;
+            const s = SF(+$("#sm-s").value),
+              k = S.smK || "free",
+              note = $("#sm-n").value.trim(),
+              err = t => ($("#sm-err").textContent = t),
+              where = o.table ? "Masa " + o.table : o.code || "#" + o.id;
+            if (!s) return err("Personel seçin.");
+            if (s.id !== S.user.id && !can("staffMeal")) return err("Başkası için kayıt yetkiniz yok.");
+            const base = { sid: s.id, name: s.n };
+            if (k === "free") {
+              let left = smLeft(s.id),
+                maas = 0;
+              const out = [];
+              o.items.forEach(i => {
+                if (i.gift || i.ikram || i.sm) return out.push(i);
+                const orig = i.price ?? P(i.pid).price,
+                  n1 = Math.min(left, i.qty),
+                  n2 = i.qty - n1;
+                left -= n1;
+                if (n1) out.push({ ...i, qty: n1, price: 0, sm: { ...base, k: "free", orig } });
+                if (n2) {
+                  const pr = Math.round(orig * (1 - SMEAL.disc / 100) * 100) / 100;
+                  maas += pr * n2;
+                  out.push({ ...i, qty: n2, price: pr, sm: { ...base, k: "maas", orig } });
+                }
+              });
+              if (maas > 0 && !note) return err("Hak aşan ürünler maaştan düşülecek: not yazın.");
+              o.items.splice(0, o.items.length, ...out);
+              if (maas > 0) {
+                s.adv.push({ date: T0, amt: maas, note: `Personel yemeği (hak aşımı) · ${where} · ${note}` });
+                o.paid.push({ m: "Maaştan kesinti", a: maas });
+              }
+              o.sm = { ...base, k, note, by: S.user.n, t: now() };
+              act("Personel yemeği", `${s.n} · ${where}${maas ? ` · hak aşımı ${fmt(maas)} maaştan` : ""}${note ? " · " + note : ""}`, "", "Personel");
+              toast(maas ? `Personel yemeği · ${fmt(maas)} maaştan düşülecek` : "Personel yemeği uygulandı");
+            } else {
+              if (k === "fam" && !note) return err("Aile / arkadaş indirimi için not yazın (kimin için).");
+              o.discount = k === "disc" ? SMEAL.disc : SMEAL.fam;
+              o.sm = { ...base, k, note, by: S.user.n, t: now() };
+              act(SMK[k], `${s.n} · %${o.discount} · ${where}${note ? " · " + note : ""}`, "", "Personel");
+              toast(`${SMK[k]} %${o.discount} uygulandı`);
+            }
+            modal("");
+            break;
           }
           case "closeTable": {
             o.status = "kapali";
@@ -11631,6 +12034,46 @@
             toast(`${ch} mesajı ${rs.length} müşteriye gönderildi (demo)`);
             break;
           }
+          case "bmWa": {
+            const t = $("#bm-t").value.trim(),
+              rs = bulkRecipients();
+            if (!t) {
+              toast("Mesajı yazın");
+              return;
+            }
+            if (!rs.length) {
+              toast("Bu seçime uyan müşteri yok");
+              return;
+            }
+            S.waSent = [];
+            waListModal(t, rs, { t, who: $("#bm-who").value, ch: "WhatsApp", tpl: S.bmTpl });
+            return;
+          }
+          case "waSent": {
+            // bağlantı WhatsApp'ı yeni sekmede açar; satırı işaretle
+            const id = +b.dataset.id;
+            if (!S.waSent.includes(id)) S.waSent.push(id);
+            const tr = $("#wa-" + id);
+            if (tr) {
+              tr.classList.add("selrow");
+              b.textContent = "✓ Açıldı";
+            }
+            return;
+          }
+          case "waDone": {
+            const n = S.waSent.length,
+              k = S.waKeep;
+            if (n) {
+              MSGLOG.unshift({ t: now(), n: k.t.slice(0, 60), ch: "WhatsApp (elle)", to: n, by: S.user.n });
+              act("WhatsApp mesajı (elle)", `${n} müşteri · ${k.t.slice(0, 40)}`, "", "Müşteri");
+            }
+            modal("");
+            toast(n ? `${n} müşteriye WhatsApp açıldı` : "Gönderim yapılmadı");
+            break;
+          }
+          case "waBack":
+            bulkModal(false, S.waKeep);
+            return;
           case "linkCust": {
             const x = byId(),
               c = C(+b.dataset.c);
@@ -12596,6 +13039,7 @@
               wage: Math.max(0, +$("#sf-w").value || 0),
               fee: role === "kurye" ? Math.max(0, Math.round(+$("#sf-f").value || 0)) : 0,
               note: $("#sf-note").value.trim(),
+              perms: [...document.querySelectorAll(".sf-pm:checked")].map(x => x.value),
             };
             if (ex) {
               Object.assign(ex, v);
@@ -12859,6 +13303,13 @@
 
       function settingsActions(a, b, o, byId, e) {
         switch (a) {
+          case "qrSync": {
+            const m = qrMenuJson();
+            saveFile("menu.json", JSON.stringify(m, null, 1), "application/json");
+            S.qrSyncAt = now();
+            act("QR menü dosyası indirildi", `${m.items.length} ürün · ${m.items.filter(x => !x.available).length} satışta değil`, "", "Menü");
+            break;
+          }
           case "tst": {
             // Bağlantı testi: önce “Kontrol ediliyor…”, sonra sonuç (demo: cihazın/platformun açık olup olmadığına göre)
             const id = b.dataset.id;
@@ -13381,12 +13832,56 @@
             kDoneModal(byId());
             return;
           case "kDoneDo": {
-            const x = byId();
-            x.collect = x.pay === "Online" ? "Online" : document.querySelector('input[name="kc"]:checked')?.value || "Nakit";
+            const x = byId(),
+              plan = planPay(x),
+              tot = net(x);
+            let pick = x.pay === "Online" ? "Online" : document.querySelector('input[name="kc"]:checked')?.value || plan;
+            delete x.paidSplit;
+            if (pick === "Parcali") {
+              const k = Math.round((+$("#kc-k").value || 0) * 100) / 100;
+              if (!(k > 0 && k < tot)) {
+                $("#kc-err").textContent = `Kartla ödenen tutarı yazın (0 ile ${fmt(tot)} arası).`;
+                return;
+              }
+              x.paidSplit = [
+                { m: "Kart", a: k },
+                { m: "Nakit", a: Math.round((tot - k) * 100) / 100 },
+              ];
+            }
+            x.collect = pick === "Parcali" ? "Parçalı" : pick;
+            const to = x.paidSplit ? x.paidSplit.map(p => `${p.m} ${fmt(p.a)}`).join(" + ") : pick;
+            // Kapıda ödeme şekli değiştiyse kayda geçer ve yönetici/yetkili onayına gider
+            if (x.pay !== "Online" && to !== plan) x.payChange = { from: plan, to, by: S.user.n, t: now(), ok: "" };
             modal("");
             setStage(x, "teslim");
-            act("Teslim edildi", `${x.code || "#" + x.id} · ${x.collect} · ${fmt(net(x))}`);
+            act("Teslim edildi", `${x.code || "#" + x.id} · ${to} · ${fmt(tot)}`);
+            if (x.payChange) act("Kapıda ödeme değişti", `${x.code || "#" + x.id} · ${plan} → ${to} · onay bekliyor`, "", "Kasa ve gider");
             break;
+          }
+          // Yönetici / yetkili: kurye ödemesini onaylar (Kasa → Kurye ödemeleri)
+          case "payOk": {
+            const x = byId();
+            need("payOk", "Kurye ödemesini onaylamak", ok => {
+              x.payChange.ok = S.user.n;
+              x.payChange.okAt = now();
+              act("Kurye ödemesi onaylandı", `${x.code || "#" + x.id} · ${x.payChange.from} → ${x.payChange.to}`, ok, "Kasa ve gider");
+              toast("Ödeme onaylandı");
+              render();
+            });
+            return;
+          }
+          // Kurye nakdi kasaya teslim etti
+          case "cashIn": {
+            const n = b.dataset.n;
+            need("payOk", "Kurye nakdini teslim almak", ok => {
+              const list = closedToday().filter(o => o.courier === n && !o.cashOk && o.paid.some(p => p.m === "Nakit"));
+              const amt = list.reduce((s, o) => s + o.paid.filter(p => p.m === "Nakit").reduce((t, p) => t + p.a, 0), 0);
+              list.forEach(o => (o.cashOk = S.user.n));
+              act("Kurye nakdi teslim alındı", `${n} · ${fmt(amt)} · ${list.length} sipariş`, ok, "Kasa ve gider");
+              toast(`${n}: ${fmt(amt)} nakit teslim alındı`);
+              render();
+            });
+            return;
           }
           default:
             return false;
