@@ -4105,6 +4105,7 @@
       /* gerçek QR menü önizlemesi (iframe) */
       .phone.live { padding: 0; background: #fff; }
       .phone.live iframe { border: 0; width: 100%; height: 100%; display: block; }
+      code.lnk { overflow-wrap: anywhere; background: var(--surface2, #eee); padding: 6px 8px; border-radius: 8px; font-size: 13px; }
     </style>
   </head>
   <body>
@@ -4813,7 +4814,8 @@
       }
 
       function net(o) {
-        return o.override != null ? o.override : Math.max(0, total(o) - campAmt(o)) * (1 - (o.discount || 0) / 100);
+        // teslimat ücreti (kendi paket siparişimiz) indirime girmez
+        return o.override != null ? o.override : Math.max(0, total(o) - campAmt(o)) * (1 - (o.discount || 0) / 100) + (o.fee || 0);
       }
 
       function paidSum(o) {
@@ -4879,6 +4881,9 @@
             if (i.sent) i.ready = false;
           });
         if (st === "kuryede") o.pickedAt = now();
+        // sunucudan gelen paket sipariş: misafirin ekranında durum güncellenir
+        if (o.srv && st === "kuryede") srvSetStatus(o.srv, "on_way");
+        if (o.srv && st === "teslim") srvSetStatus(o.srv, "delivered");
         if (st === "teslim") {
           o.status = "kapali";
           o.closedAt = now();
@@ -5516,6 +5521,7 @@
           INTEG,
           SMEAL,
           SRV,
+          ONL,
           PRINTROUTE,
           KVKK,
           EXTRA,
@@ -5566,7 +5572,7 @@
             DEV,
             PLATFORMS,
           },
-          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, SMEAL, SRV };
+          O = { ING, RECIPES, HALLS, LOY, SET, KASA, INTEG, PRINTROUTE, KVKK, EXTRA, QRORD, ROLES, SMEAL, SRV, ONL };
         Object.entries(A).forEach(([k, a]) => {
           if (Array.isArray(d[k])) a.splice(0, a.length, ...d[k]);
         });
@@ -5694,7 +5700,14 @@
         if (!srvReady()) return;
         const menu = qrMenuJson(),
           tables = Object.values(HALLS).flat(),
-          cfg = { qr_on: QRORD.on, approve: QRORD.approve, one_pending: QRORD.onePending, max_items: QRORD.maxItems };
+          kurus = tl => Math.round((+tl || 0) * 100),
+          cfg = {
+            qr_on: QRORD.on,
+            approve: QRORD.approve,
+            one_pending: QRORD.onePending,
+            max_items: QRORD.maxItems,
+            delivery: { on: !!ONL.on, min: kurus(ONL.min), fee: kurus(ONL.fee), free: kurus(ONL.free), open: ONL.open || "", close: ONL.close || "", eta: ONL.eta || "", pay: { ...ONL.pay } },
+          };
         const h = JSON.stringify([menu.categories, menu.items, tables, cfg]);
         if (!force && h === SRV.hash) return;
         try {
@@ -5718,6 +5731,10 @@
           SRV.err = "";
           let added = 0;
           (list || []).forEach(o => {
+            if (o.kind === "paket") {
+              if (srvPaket(o)) added++;
+              return;
+            }
             if (QRQ.some(q => q.srv === o.id)) return;
             const q = {
               id: ++QRID,
@@ -5752,6 +5769,41 @@
         } catch (e) {
           SRV.err = e.message === "bad_key" ? "Senkron anahtarı yanlış" : "Sunucuya ulaşılamadı";
         }
+      }
+
+      // Kendi linkimizden gelen paket sipariş → WhatsApp kanalı (Ana Sayfa'da onay bekler, sonra kurye akışı)
+      function srvPaket(o) {
+        if (S.orders.some(x => x.srv === o.id)) return false;
+        const PAY = { online: "Online", kapida_nakit: "Kapıda nakit", kapida_kart: "Kapıda kart" };
+        const items = o.items.map(l => {
+          const mods = qrMods(l.item_id, l.opts);
+          return { pid: l.item_id, qty: l.qty, note: l.note || "", mods, price: l.unit_price / 100, sent: false, by: "Misafir (link)" };
+        });
+        const x = mk({
+          channel: "whatsapp",
+          stage: "yeni",
+          code: "WA-" + o.code,
+          customer: { name: o.guest_name, phone: o.guest_phone, address: o.address },
+          pay: PAY[o.pay] || "Online",
+          note: o.note,
+          items,
+        });
+        x.srv = o.id;
+        x.fee = (o.fee || 0) / 100;
+        x.src = o.source || "";
+        if (o.pay === "online") {
+          x.paid = [{ m: "Online (link)", a: o.total / 100 }];
+          x.online = true;
+        }
+        S.orders.push(x);
+        act("Yeni sipariş geldi", `${CH.whatsapp.n} ${x.code} · ${fmt(net(x))} · ${x.pay}${x.src ? " · kaynak " + x.src : ""}`, "", "Sipariş", "Misafir (link)");
+        beep();
+        if (S.autoAccept) {
+          x.stage = "alindi";
+          sendItems(x, "Satış: " + CH.whatsapp.n + " " + x.code);
+          srvSetStatus(o.id, "accepted", "Otomatik");
+        }
+        return true;
       }
 
       // Garson onayladı / reddetti → misafirin ekranında görünür
@@ -6536,6 +6588,9 @@
         // Platform komisyonu (%) — platform sözleşmesindeki oran. Raporlarda ciro, komisyon ve restorana kalan ayrı görünür.
         comm: { yemeksepeti: 0, getir: 0, trendyol: 0, migros: 0 },
       };
+
+      // Kendi online paket siparişimiz (WhatsApp / Instagram linki). Tutarlar ₺; sunucuya kuruş olarak gider.
+      const ONL = { on: true, min: 250, fee: 30, free: 0, open: "11:00", close: "23:00", eta: "30–45 dk", pay: { online: true, kapida_nakit: true, kapida_kart: true } };
 
       const PRINTROUTE = { icecek: "bp" }; // kategori → yazıcı (yoksa mutfak)
 
@@ -7490,6 +7545,7 @@
         const items = `<div class="oitems">${o.items.map(i => `${i.qty}× ${esc(iName(i))}${i.mods && i.mods.length ? ` <small>(${esc(iMods(i))})</small>` : ""}${i.ikram ? " <small>(ikram)</small>" : ""}${i.note ? ` <small>(${esc(i.note)})</small>` : ""}`).join(", ")}</div>`;
         const note = o.note ? `<div class="onote">Not: ${esc(o.note)}</div>` : "";
         const onl = paidOnline(o) ? '<span class="chip ok">Online ödendi</span>' : "";
+        const feeL = o.fee ? `<div class="hint">Teslimat ücreti ${fmt(o.fee)}${o.src ? ` · kaynak: ${esc(o.src)}` : ""}</div>` : "";
         let match = "";
         if (on && !closed) {
           if (cu)
@@ -7527,7 +7583,7 @@
         }
         return `<article class="oc ${S.seen.has(o.id) ? "" : "fresh"}" style="--c:${c.c}">
         <div class="oh"><span class="ch" style="--c:${c.c}">${c.n}</span><span class="oid">${o.code || "#" + o.id}</span><span class="hint" data-since="${o.createdAt}">${ago(o.createdAt)}</span>${isQr(o) ? '<span class="chip">QR</span>' : ""}<b class="num" style="margin-left:auto">${fmt(net(o))}</b></div>
-        <div>${who} ${onl}</div>${sub}${items}${note}${match}${ctrl}</article>`;
+        <div>${who} ${onl}</div>${feeL}${sub}${items}${note}${match}${ctrl}</article>`;
       }
     </script>
 
@@ -9676,13 +9732,40 @@
         return `<div class="tabs settabs">${tabs}</div>${body}`;
       }
 
+      // Kendi online paket siparişimiz: WhatsApp / Instagram'a konan link. Komisyon yok.
+      function onlPanel() {
+        const base = (S.qrBase || "").replace(/\/?$/, "/"),
+          link = base ? base + "?paket=wa" : "",
+          ig = base ? base + "?paket=ig" : "",
+          hello = `Merhaba, ${S.rname || "Nazura"}'ya hoş geldiniz!\nSipariş vermek için menümüz: ${link}\nMenüden seçin, adresinizi yazın; online veya kapıda ödeyin. Siparişiniz hemen mutfağa düşer.`;
+        const pay = (k, l) => `<label class="check"><input type="checkbox" data-act="onlPay" data-k="${k}" ${ONL.pay[k] ? "checked" : ""}> ${l}</label>`;
+        return `<section class="panel" style="margin-bottom:14px"><div class="split"><h3>Kendi online siparişimiz (WhatsApp linki)</h3>${ONL.on ? '<span class="chip ok">Açık</span>' : '<span class="chip">Kapalı</span>'}</div>
+        <p class="hint" style="margin:0">Müşteri WhatsApp'tan yazınca otomatik cevapla bu link gider; menüden seçip adresini yazar, online veya kapıda öder. Sipariş Ana Sayfa'ya <b>WhatsApp</b> siparişi olarak düşer (onay → mutfak → kurye). Platform komisyonu yok. Çalışması için sunucu bağlı olmalı (Menü ve QR → Sunucu bağlantısı).</p>
+        <label class="check"><input type="checkbox" data-act="onlSet" data-k="on" ${ONL.on ? "checked" : ""}> Online paket sipariş açık</label>
+        <div class="gform">
+         <div class="field"><label class="lbl" for="onl-min">Minimum sipariş (₺)</label><input id="onl-min" class="num" type="number" min="0" step="5" value="${ONL.min}" data-act="onlSet" data-k="min"></div>
+         <div class="field"><label class="lbl" for="onl-fee">Teslimat ücreti (₺)</label><input id="onl-fee" class="num" type="number" min="0" step="5" value="${ONL.fee}" data-act="onlSet" data-k="fee"></div>
+         <div class="field"><label class="lbl" for="onl-free">Şu tutarın üstü ücretsiz (₺, 0 = yok)</label><input id="onl-free" class="num" type="number" min="0" step="10" value="${ONL.free}" data-act="onlSet" data-k="free"></div>
+         <div class="field"><label class="lbl" for="onl-open">Sipariş başlangıç</label><input id="onl-open" type="time" value="${ONL.open}" data-act="onlSet" data-k="open"></div>
+         <div class="field"><label class="lbl" for="onl-close">Sipariş bitiş</label><input id="onl-close" type="time" value="${ONL.close}" data-act="onlSet" data-k="close"></div>
+         <div class="field"><label class="lbl" for="onl-eta">Tahmini teslim süresi</label><input id="onl-eta" value="${esc(ONL.eta)}" maxlength="20" placeholder="30–45 dk" data-act="onlSet" data-k="eta"></div>
+        </div>
+        <div class="field"><span class="lbl">Ödeme yöntemleri</span><div class="row">${pay("online", "Online öde")}${pay("kapida_nakit", "Kapıda nakit")}${pay("kapida_kart", "Kapıda kart")}</div></div>
+        ${
+          link
+            ? `<div class="field"><span class="lbl">WhatsApp linki</span><div class="row"><code class="lnk">${esc(link)}</code><button class="btn sm" data-act="copyTxt" data-t="${esc(link)}">Kopyala</button></div><small class="hint">Instagram için: <code>${esc(ig)}</code> — raporda hangi kanaldan geldiği görünür.</small></div>
+        <div class="field"><span class="lbl">WhatsApp otomatik mesajı (Karşılama ve Uzakta mesajı)</span><textarea readonly rows="4">${esc(hello)}</textarea><div class="row"><button class="btn sm" data-act="copyTxt" data-t="${esc(hello)}">Metni kopyala</button><span class="hint">WhatsApp Business → Araçlar → Karşılama mesajı ve Uzakta mesajı (“Her zaman gönder”).</span></div></div>`
+            : '<p class="hint">Önce Menü ve QR bölümünde QR menü adresini yazın.</p>'
+        }</section>`;
+      }
+
       function entBody() {
         const st = (on, t) =>
             `<span class="dot" style="--c:${on ? "var(--ok)" : "var(--warn)"}">${on ? "Bağlı (demo)" : t || "Bağlı değil"}</span>`,
           I = INTEG;
         const ap = (k, n, h) =>
           `<div class="dev"><div class="split"><h3>${n}</h3>${st(I[k].on, "Başvuru gerekli")}</div><div class="hint">${h}</div>${testLine(k)}<div class="row"><button class="btn ghost" data-act="intToggle" data-k="${k}">${I[k].on ? "Bağlantıyı kes (demo)" : "Bağlandı olarak işaretle (demo)"}</button></div></div>`;
-        return `<section class="panel" style="margin-bottom:14px"><h3>Platform komisyonları</h3><p class="hint" style="margin:0">Yemek uygulamaları her siparişten komisyon alır. Sözleşmenizdeki oranı yazın; raporlarda ciro, komisyon ve restorana kalan tutar ayrı görünür. Oran değişirse eski siparişler kendi oranıyla kalır.</p>
+        return onlPanel() + `<section class="panel" style="margin-bottom:14px"><h3>Platform komisyonları</h3><p class="hint" style="margin:0">Yemek uygulamaları her siparişten komisyon alır. Sözleşmenizdeki oranı yazın; raporlarda ciro, komisyon ve restorana kalan tutar ayrı görünür. Oran değişirse eski siparişler kendi oranıyla kalır.</p>
         <div class="gform">${APPCH.map(k => `<div class="field"><label class="lbl" for="cm-${k}">${CH[k].n} (%)</label><input id="cm-${k}" class="num" type="number" min="0" max="60" step="0.5" value="${I.comm?.[k] ?? 0}" data-act="commSet" data-k="${k}"></div>`).join("")}</div></section>
         <p class="hint" style="margin:0 0 14px">Her kartta “Test et” bağlantıyı dener ve sonucu yazar: bağlı mı, değilse ne yapmalı. ÖKC ve e-Arşiv “Kasa ve ÖKC” sekmesinde. Demo: bağlantılar taklit edilir. Canlı sistemde her platformun resmi API erişimi gerekir; erişim gelince siparişler ana sayfaya otomatik düşer, fiyat ve “ürün kapandı” bilgisi platformlara otomatik gider.</p>
        <div class="devs"><div class="dev"><div class="split"><h3>Trendyol Yemek</h3>${st(I.trendyol.on)}</div><div class="hint">Partner paneli → Hesap Bilgilerim → Entegrasyon Bilgileri'ndeki bilgileri girin.</div>
@@ -10473,6 +10556,7 @@
          )
          .join("")}<div class="split"><b>Toplam</b><b class="num">${fmt(net(o))}</b></div></div>
        ${o.voids?.length ? `<div class="field"><span class="lbl">İptal edilen ürünler</span>${o.voids.map(v => `<div class="split"><span>${v.n}× ${esc(v.name)}${v.qr ? ' <span class="chip">QR</span>' : ""} <small class="hint">· ${esc(v.why)}</small></span><span><b>İptal eden: ${esc(v.by)}</b> <small class="hint num">${tStr(v.t)}</small></span></div>`).join("")}</div>` : ""}
+       ${o.fee ? `<div class="field"><span class="lbl">Teslimat ücreti</span><div class="split"><span>${o.src ? "Kaynak: " + esc(o.src) : "Kendi online siparişimiz"}</span><span class="num">${fmt(o.fee)}</span></div></div>` : ""}
        ${commRate(o) ? `<div class="field"><span class="lbl">Platform komisyonu</span><div class="split"><span>%${commRate(o)} · ${CH[o.channel].n}</span><span class="num">−${fmt(commOf(o))}</span></div><div class="split"><b>Restorana kalan</b><b class="num">${fmt(net(o) - commOf(o))}</b></div></div>` : ""}
        ${o.sm ? `<div class="field"><span class="lbl">Personel</span><div><span class="chip">${SMK[o.sm.k]}</span> <b>${esc(o.sm.name)}</b>${o.sm.note ? ` · Not: ${esc(o.sm.note)}` : ""} <small class="hint">· kaydeden ${esc(o.sm.by)}</small></div></div>` : ""}
        ${o.payChange ? `<div class="field"><span class="lbl">Kapıda ödeme değişti</span><div>${esc(o.payChange.from)} → <b>${esc(o.payChange.to)}</b> · kurye ${esc(o.payChange.by)} · ${o.payChange.ok ? `onaylayan <b>${esc(o.payChange.ok)}</b>` : '<span class="chip warn">onay bekliyor</span>'}</div></div>` : ""}
@@ -10997,6 +11081,17 @@
           const sp = $("#kc-split");
           if (sp) sp.hidden = b.value !== "Parcali";
           if (b.value === "Parcali") setTimeout(() => $("#kc-k")?.focus(), 20);
+          return;
+        }
+        if (a === "onlSet" || a === "onlPay") {
+          const k = b.dataset.k;
+          if (a === "onlPay") ONL.pay[k] = b.checked;
+          else if (k === "on") ONL.on = b.checked;
+          else if (["min", "fee", "free"].includes(k)) ONL[k] = Math.max(0, +b.value || 0);
+          else ONL[k] = b.value.trim();
+          act("Online sipariş ayarı", `${k}: ${a === "onlPay" ? (b.checked ? "açık" : "kapalı") : k === "on" ? (b.checked ? "açık" : "kapalı") : ONL[k]}`, "", "Ayarlar");
+          toast("Kaydedildi" + (srvReady() ? " · QR menüye gidiyor" : ""));
+          if (k === "on") render();
           return;
         }
         if (a === "commSet") {
@@ -11669,6 +11764,7 @@
             const x = byId();
             x.stage = "alindi";
             sendItems(x, "Satış: " + CH[x.channel].n + " " + (x.code || "#" + x.id));
+            if (x.srv) srvSetStatus(x.srv, "accepted", S.user.n);
             toast("Onaylandı: sipariş alındı, mutfağa gitti" + autoPrint(x) + S.lastRoute);
             break;
           }
@@ -11678,6 +11774,7 @@
             x.closedAt = now();
             x.cancelBy = S.user.n;
             x.cancelReason = x.cancelReason || "Reddedildi";
+            if (x.srv) srvSetStatus(x.srv, "rejected", S.user.n, x.cancelReason);
             toast("Sipariş reddedildi");
             act("Sipariş reddedildi", `${CH[x.channel].n} ${x.code || "#" + x.id}`, "", "Sipariş");
             break;
@@ -11787,6 +11884,7 @@
             x.closedAt = now();
             x.cancelReason = $("#cr").value;
             x.cancelBy = S.user.n;
+            if (x.srv) srvSetStatus(x.srv, "rejected", S.user.n, x.cancelReason);
             act("Sipariş iptal", `${x.code || "#" + x.id} · ${x.cancelReason}`);
             modal("");
             toast(`Sipariş iptal edildi · ${x.cancelReason}`);
@@ -13474,6 +13572,14 @@
 
       function settingsActions(a, b, o, byId, e) {
         switch (a) {
+          case "copyTxt": {
+            const t = b.dataset.t;
+            Promise.resolve()
+              .then(() => navigator.clipboard.writeText(t))
+              .then(() => toast("Kopyalandı"))
+              .catch(() => toast("Kopyalanamadı: metni seçip elle kopyalayın"));
+            return;
+          }
           case "srvOn": {
             const k = $("#srv-k").value.trim();
             if (k.length < 32) {
